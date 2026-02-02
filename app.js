@@ -1,1257 +1,1113 @@
+/* =========================================================
+   MILLER MANAGEMENT SYSTEM
+   Online DB: Supabase (Shared Login)
+   PART 1/4 – Supabase Setup + Login + Helpers
+   ========================================================= */
+
 /* =========================
-   Miller Management System (Offline)
-   - multi-item truck memo
-   - edit/delete
-   - report filters + pdf (bank statement)
-   - backup import/export
+   SUPABASE CONFIG
 ========================= */
+const SUPABASE_URL = "https://fqvldojgmuwjaepnjziu.supabase.co";
+const SUPABASE_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZxdmxkb2pnbXV3amFlcG5qeml1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAwMjM0MTYsImV4cCI6MjA4NTU5OTQxNn0.l9UL5l8y065oRWznBXYytZh3AR7PHR9Bfs6jibomELE";
 
-const DB_KEY = "MM_DB_v3";
-const UI_KEY = "MM_UI_v3";
+const supabase = window.supabase.createClient(
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY
+);
 
+/* =========================
+   GLOBAL DB (IN MEMORY)
+========================= */
+let DB = {
+  millers: [],
+  clients: [],
+  products: [],
+  truckMemos: []
+};
+
+/* =========================
+   DOM HELPERS
+========================= */
 const $ = (id) => document.getElementById(id);
-const q = (sel, root=document) => root.querySelector(sel);
-const qa = (sel, root=document) => [...root.querySelectorAll(sel)];
+const q = (sel) => document.querySelector(sel);
+const qa = (sel) => Array.from(document.querySelectorAll(sel));
 
-function uid(prefix="ID"){ return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`; }
-function todayISO(){
-  const d = new Date();
-  const m = String(d.getMonth()+1).padStart(2,"0");
-  const day = String(d.getDate()).padStart(2,"0");
-  return `${d.getFullYear()}-${m}-${day}`;
+function todayISO() {
+  return new Date().toISOString().slice(0, 10);
 }
-function fmt3(n){ return Number(n||0).toFixed(3); }
-function safeText(s){ return (s ?? "").toString().trim(); }
 
-function escapeHtml(s){
-  return (s ?? "").toString()
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;")
-    .replaceAll("'","&#039;");
-}
-function escapeAttr(s){ return escapeHtml(s).replaceAll("\n"," "); }
-
-function loadDB(){
-  const raw = localStorage.getItem(DB_KEY);
-  if(raw){ try { return JSON.parse(raw); } catch(_){} }
-  const seed = { millers:[], clients:[], products:[], truckMemos:[] };
-  localStorage.setItem(DB_KEY, JSON.stringify(seed));
-  return seed;
-}
-function saveDB(db){ localStorage.setItem(DB_KEY, JSON.stringify(db)); }
-
-function loadUI(){
-  const raw = localStorage.getItem(UI_KEY);
-  if(raw){ try { return JSON.parse(raw); } catch(_){} }
-  const seed = { theme:"dark", accentIndex:0 };
-  localStorage.setItem(UI_KEY, JSON.stringify(seed));
-  return seed;
-}
-function saveUI(ui){ localStorage.setItem(UI_KEY, JSON.stringify(ui)); }
-
-let DB = loadDB();
-let UI = loadUI();
-
-let lastPreviewMemoId = null;   // memo selected for preview/print
-let editingMemoId = null;       // memo selected for editing
-
-/* =========================
-   Theme
-========================= */
-const ACCENTS = ["#6ee7ff","#a78bfa","#34d399","#fb7185","#fbbf24","#60a5fa"];
-function applyTheme(){
-  document.documentElement.setAttribute("data-theme", UI.theme === "light" ? "light":"dark");
-  document.documentElement.style.setProperty("--accent", ACCENTS[UI.accentIndex % ACCENTS.length]);
-}
-applyTheme();
-
-$("btnTheme").onclick = () => { UI.theme = (UI.theme === "light" ? "dark":"light"); saveUI(UI); applyTheme(); };
-$("btnAccent").onclick = () => { UI.accentIndex = (UI.accentIndex+1) % ACCENTS.length; saveUI(UI); applyTheme(); };
-
-/* =========================
-   Navigation
-========================= */
-const routes = {
-  dashboard: { title:"Dashboard", sub:"Quick totals & recent documents" },
-  millers:   { title:"Master • Millers", sub:"Miller list with logo & seal" },
-  clients:   { title:"Master • Clients", sub:"Client list with address" },
-  products:  { title:"Master • Products", sub:"Commodity / product list" },
-  truckmemo: { title:"Truck Memo", sub:"Create or edit memo + preview/print" },
-  reports:   { title:"Reports", sub:"Filter • Edit/Delete • Export • Backup • PDF" },
-};
-
-function go(route){
-  qa(".navBtn").forEach(b => b.classList.toggle("active", b.dataset.route === route));
-  qa(".page").forEach(p => p.classList.add("hidden"));
-  $(`page-${route}`).classList.remove("hidden");
-  $("pageTitle").textContent = routes[route]?.title || "Page";
-  $("pageSub").textContent = routes[route]?.sub || "";
-
-  if(route === "dashboard") renderDashboard();
-  if(route === "millers")  renderMillers();
-  if(route === "clients")  renderClients();
-  if(route === "products") renderProducts();
-  if(route === "truckmemo") prepareTruckForm();
-  if(route === "reports")  prepareReports();
-}
-qa(".navBtn").forEach(b => b.onclick = () => go(b.dataset.route));
-
-/* =========================
-   Modal
-========================= */
-function openModal(title, bodyHTML){
-  $("modalTitle").textContent = title;
-  $("modalBody").innerHTML = bodyHTML;
-  $("modal").classList.remove("hidden");
-}
-function closeModal(){ $("modal").classList.add("hidden"); $("modalBody").innerHTML=""; }
-$("modalClose").onclick = closeModal;
-$("modal").onclick = (e) => { if(e.target.id === "modal") closeModal(); };
-
-/* =========================
-   File -> Base64
-========================= */
-function fileToBase64(file){
-  return new Promise((resolve,reject)=>{
-    const r = new FileReader();
-    r.onload = () => resolve(r.result);
-    r.onerror = reject;
-    r.readAsDataURL(file);
-  });
+function uid(prefix = "ID") {
+  return (
+    prefix +
+    "_" +
+    Date.now() +
+    "_" +
+    Math.random().toString(16).slice(2)
+  );
 }
 
 /* =========================
-   Helpers
+   LOGIN OVERLAY UI
 ========================= */
-function fillSelect(sel, arr, placeholder){
-  sel.innerHTML = "";
-  if(placeholder){
-    const opt = document.createElement("option");
-    opt.value=""; opt.textContent=placeholder;
-    sel.appendChild(opt);
-  }
-  arr.forEach(x=>{
-    const opt = document.createElement("option");
-    opt.value = x.id;
-    opt.textContent = x.name;
-    sel.appendChild(opt);
-  });
-}
+function showLogin() {
+  if ($("loginOverlay")) return;
 
-function refreshDropdowns(){
-  fillSelect($("tmClient"), DB.clients, "Select Client");
-  fillSelect($("tmMiller"), DB.millers, "Select Miller");
+  const div = document.createElement("div");
+  div.id = "loginOverlay";
+  div.style.cssText = `
+    position:fixed; inset:0;
+    background:rgba(0,0,0,.65);
+    display:flex; align-items:center; justify-content:center;
+    z-index:9999;
+  `;
 
-  fillSelect($("rMiller"), [{id:"", name:"All Millers"}, ...DB.millers], "");
-  fillSelect($("rClient"), [{id:"", name:"All Clients"}, ...DB.clients], "");
-  fillSelect($("rProduct"), [{id:"", name:"All Products"}, ...DB.products], "");
-}
+  div.innerHTML = `
+    <div style="
+      width:360px; max-width:92%;
+      background:#111827; color:#fff;
+      border-radius:14px; padding:20px;
+      box-shadow:0 20px 50px rgba(0,0,0,.6)
+    ">
+      <h2 style="margin:0 0 8px">Miller Management</h2>
+      <div style="font-size:12px; opacity:.8; margin-bottom:14px">
+        Shared Office Login
+      </div>
 
-/* =========================
-   Migration (if old data exists)
-========================= */
-function normalizeMemos(){
-  let changed = false;
-  DB.truckMemos = (DB.truckMemos || []).map(m=>{
-    if(Array.isArray(m.items)) return m;
-    // old single product memo format -> items
-    if(m.productId){
-      changed = true;
-      return {
-        ...m,
-        items: [{
-          id: uid("IT"),
-          productId: m.productId,
-          bags: Number(m.bags||0),
-          netMts: Number(m.netMts||0),
-          rateMode: m.rateMode || "BAG",
-          rate: Number(m.rate||0),
-          amount: Number(m.amount||0),
-        }]
-      };
+      <label>Email</label>
+      <input id="loginEmail" type="email"
+        style="width:100%; padding:10px; margin:6px 0 12px;
+        border-radius:8px; border:1px solid #374151; background:#020617; color:#fff">
+
+      <label>Password</label>
+      <input id="loginPass" type="password"
+        style="width:100%; padding:10px; margin:6px 0 14px;
+        border-radius:8px; border:1px solid #374151; background:#020617; color:#fff">
+
+      <button id="btnLogin" style="
+        width:100%; padding:10px;
+        border-radius:10px; border:0;
+        font-weight:700; background:#2563eb; color:#fff;
+        cursor:pointer
+      ">LOGIN</button>
+
+      <div id="loginMsg"
+        style="margin-top:10px; font-size:12px; min-height:16px"></div>
+    </div>
+  `;
+
+  document.body.appendChild(div);
+
+  $("btnLogin").onclick = async () => {
+    $("loginMsg").textContent = "Logging in...";
+    try {
+      const email = $("loginEmail").value.trim();
+      const pass = $("loginPass").value;
+
+      const { error } =
+        await supabase.auth.signInWithPassword({
+          email,
+          password: pass
+        });
+
+      if (error) throw error;
+    } catch (e) {
+      $("loginMsg").textContent = e.message;
     }
-    changed = true;
-    return { ...m, items: [] };
-  });
-  if(changed) saveDB(DB);
-}
-
-/* =========================
-   Masters CRUD
-========================= */
-$("btnAddMiller").onclick = () => openMillerModal(null);
-$("btnAddClient").onclick = () => openClientModal(null);
-$("btnAddProduct").onclick = () => openProductModal(null);
-
-function renderMillers(){
-  const tb = q("#tblMillers tbody"); tb.innerHTML = "";
-  DB.millers.forEach(m=>{
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td><b>${escapeHtml(m.name)}</b></td>
-      <td>${escapeHtml(m.mobile||"")}</td>
-      <td>${escapeHtml(m.address||"").replace(/\n/g,"<br>")}</td>
-      <td>${m.logo ? "Yes":"No"}</td>
-      <td>${m.seal ? "Yes":"No"}</td>
-      <td>
-        <div class="row gap8">
-          <button class="btn" data-act="edit">Edit</button>
-          <button class="btn danger" data-act="del">Delete</button>
-        </div>
-      </td>
-    `;
-    q('[data-act="edit"]', tr).onclick = ()=> openMillerModal(m);
-    q('[data-act="del"]', tr).onclick = ()=> deleteMiller(m.id);
-    tb.appendChild(tr);
-  });
-  refreshDropdowns();
-}
-
-function renderClients(){
-  const tb = q("#tblClients tbody"); tb.innerHTML = "";
-  DB.clients.forEach(c=>{
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td><b>${escapeHtml(c.name)}</b></td>
-      <td>${escapeHtml(c.mobile||"")}</td>
-      <td>${escapeHtml(c.address||"").replace(/\n/g,"<br>")}</td>
-      <td>
-        <div class="row gap8">
-          <button class="btn" data-act="edit">Edit</button>
-          <button class="btn danger" data-act="del">Delete</button>
-        </div>
-      </td>
-    `;
-    q('[data-act="edit"]', tr).onclick = ()=> openClientModal(c);
-    q('[data-act="del"]', tr).onclick = ()=> deleteClient(c.id);
-    tb.appendChild(tr);
-  });
-  refreshDropdowns();
-}
-
-function renderProducts(){
-  const tb = q("#tblProducts tbody"); tb.innerHTML = "";
-  DB.products.forEach(p=>{
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td><b>${escapeHtml(p.name)}</b></td>
-      <td>${escapeHtml(p.hsn||"")}</td>
-      <td>
-        <div class="row gap8">
-          <button class="btn" data-act="edit">Edit</button>
-          <button class="btn danger" data-act="del">Delete</button>
-        </div>
-      </td>
-    `;
-    q('[data-act="edit"]', tr).onclick = ()=> openProductModal(p);
-    q('[data-act="del"]', tr).onclick = ()=> deleteProduct(p.id);
-    tb.appendChild(tr);
-  });
-  refreshDropdowns();
-}
-
-/* Miller modal */
-function openMillerModal(existing){
-  const m = existing ? {...existing} : { id: uid("MIL"), name:"", mobile:"", address:"", logo:"", seal:"" };
-  openModal(existing ? "Edit Miller" : "Add Miller", `
-    <form id="fmMiller" class="form">
-      <div class="grid2">
-        <label class="field"><span>Miller Name</span><input id="mName" value="${escapeAttr(m.name)}" required></label>
-        <label class="field"><span>Mobile</span><input id="mMobile" value="${escapeAttr(m.mobile||"")}"></label>
-        <label class="field" style="grid-column:1/-1"><span>Address</span>
-          <textarea id="mAddress" rows="3">${escapeHtml(m.address||"")}</textarea>
-        </label>
-        <label class="field"><span>Logo</span><input id="mLogo" type="file" accept="image/*"></label>
-        <label class="field"><span>Seal</span><input id="mSeal" type="file" accept="image/*"></label>
-        <div class="muted" style="grid-column:1/-1">Tip: If you don’t select a new file, old logo/seal stays.</div>
-      </div>
-      <div class="row gap8 mt12">
-        <button class="btn primary" type="submit">Save</button>
-        <button class="btn" type="button" id="mCancel">Cancel</button>
-      </div>
-    </form>
-  `);
-  $("mCancel").onclick = closeModal;
-
-  q("#fmMiller").onsubmit = async (e)=>{
-    e.preventDefault();
-    m.name = safeText($("mName").value);
-    if(!m.name){ alert("Miller name required"); return; }
-    m.mobile = safeText($("mMobile").value);
-    m.address = safeText($("mAddress").value);
-
-    const lf = $("mLogo").files?.[0];
-    const sf = $("mSeal").files?.[0];
-    if(lf) m.logo = await fileToBase64(lf);
-    if(sf) m.seal = await fileToBase64(sf);
-
-    const idx = DB.millers.findIndex(x=>x.id===m.id);
-    if(idx>=0) DB.millers[idx]=m; else DB.millers.unshift(m);
-
-    saveDB(DB); closeModal(); renderMillers();
   };
 }
-function deleteMiller(id){
-  if(!confirm("Delete this miller?")) return;
-  DB.millers = DB.millers.filter(x=>x.id!==id);
-  saveDB(DB); renderMillers();
-}
 
-/* Client modal */
-function openClientModal(existing){
-  const c = existing ? {...existing} : { id: uid("CLI"), name:"", mobile:"", address:"" };
-  openModal(existing ? "Edit Client" : "Add Client", `
-    <form id="fmClient" class="form">
-      <div class="grid2">
-        <label class="field"><span>Client Name</span><input id="cName" value="${escapeAttr(c.name)}" required></label>
-        <label class="field"><span>Mobile</span><input id="cMobile" value="${escapeAttr(c.mobile||"")}"></label>
-        <label class="field" style="grid-column:1/-1"><span>Address</span>
-          <textarea id="cAddress" rows="3">${escapeHtml(c.address||"")}</textarea>
-        </label>
-      </div>
-      <div class="row gap8 mt12">
-        <button class="btn primary" type="submit">Save</button>
-        <button class="btn" type="button" id="cCancel">Cancel</button>
-      </div>
-    </form>
-  `);
-  $("cCancel").onclick = closeModal;
-
-  q("#fmClient").onsubmit = (e)=>{
-    e.preventDefault();
-    c.name = safeText($("cName").value);
-    if(!c.name){ alert("Client name required"); return; }
-    c.mobile = safeText($("cMobile").value);
-    c.address = safeText($("cAddress").value);
-
-    const idx = DB.clients.findIndex(x=>x.id===c.id);
-    if(idx>=0) DB.clients[idx]=c; else DB.clients.unshift(c);
-
-    saveDB(DB); closeModal(); renderClients();
-  };
-}
-function deleteClient(id){
-  if(!confirm("Delete this client?")) return;
-  DB.clients = DB.clients.filter(x=>x.id!==id);
-  saveDB(DB); renderClients();
-}
-
-/* Product modal */
-function openProductModal(existing){
-  const p = existing ? {...existing} : { id: uid("PRD"), name:"", hsn:"" };
-  openModal(existing ? "Edit Product" : "Add Product", `
-    <form id="fmProduct" class="form">
-      <div class="grid2">
-        <label class="field"><span>Commodity</span><input id="pName" value="${escapeAttr(p.name)}" required></label>
-        <label class="field"><span>HSN (optional)</span><input id="pHSN" value="${escapeAttr(p.hsn||"")}"></label>
-      </div>
-      <div class="row gap8 mt12">
-        <button class="btn primary" type="submit">Save</button>
-        <button class="btn" type="button" id="pCancel">Cancel</button>
-      </div>
-    </form>
-  `);
-  $("pCancel").onclick = closeModal;
-
-  q("#fmProduct").onsubmit = (e)=>{
-    e.preventDefault();
-    p.name = safeText($("pName").value);
-    if(!p.name){ alert("Commodity required"); return; }
-    p.hsn = safeText($("pHSN").value);
-
-    const idx = DB.products.findIndex(x=>x.id===p.id);
-    if(idx>=0) DB.products[idx]=p; else DB.products.unshift(p);
-
-    saveDB(DB); closeModal(); renderProducts();
-  };
-}
-function deleteProduct(id){
-  if(!confirm("Delete this product?")) return;
-  DB.products = DB.products.filter(x=>x.id!==id);
-  saveDB(DB); renderProducts();
+function hideLogin() {
+  const el = $("loginOverlay");
+  if (el) el.remove();
 }
 
 /* =========================
-   Truck Memo Items Table (multi rows)
+   AUTH STATE HANDLER
 ========================= */
-$("btnAddItemRow").onclick = ()=> addItemRow();
-
-function addItemRow(prefill=null){
-  const tb = q("#tmItemsTable tbody");
-  const tr = document.createElement("tr");
-  tr.dataset.id = (prefill?.id || uid("IT"));
-
-  tr.innerHTML = `
-    <td class="rowNo"></td>
-    <td><select class="itProduct"></select></td>
-    <td><input class="itBags" type="number" min="0" step="1" value="${prefill?.bags ?? 0}"></td>
-    <td><input class="itNet" type="number" min="0" step="0.001" value="${prefill?.netMts ?? 0}"></td>
-    <td>
-      <select class="itMode">
-        <option value="BAG" ${prefill?.rateMode==="BAG" ? "selected":""}>BAG</option>
-        <option value="MTS" ${prefill?.rateMode==="MTS" ? "selected":""}>MTS</option>
-      </select>
-    </td>
-    <td><input class="itRate" type="number" min="0" step="0.01" value="${prefill?.rate ?? 0}"></td>
-    <td><input class="itAmt" type="text" readonly value="${Number(prefill?.amount ?? 0).toFixed(2)}"></td>
-    <td><button type="button" class="btn danger itRemove">X</button></td>
-  `;
-
-  const sel = q(".itProduct", tr);
-  sel.innerHTML =
-    `<option value="">Select</option>` +
-    DB.products.map(p=>`<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
-  sel.value = prefill?.productId || "";
-
-  const recalc = ()=> recalcRow(tr);
-
-  ["change","input"].forEach(ev=>{
-    sel.addEventListener(ev, recalc);
-    q(".itBags", tr).addEventListener(ev, recalc);
-    q(".itNet", tr).addEventListener(ev, recalc);
-    q(".itMode", tr).addEventListener(ev, recalc);
-    q(".itRate", tr).addEventListener(ev, recalc);
-  });
-
-  q(".itRemove", tr).onclick = ()=>{
-    tr.remove();
-    renumberRows();
-    recalcGrandTotal();
-  };
-
-  tb.appendChild(tr);
-  renumberRows();
-  recalcRow(tr);
-}
-
-function renumberRows(){
-  qa("#tmItemsTable tbody tr").forEach((tr, idx)=>{
-    q(".rowNo", tr).textContent = String(idx+1);
-  });
-}
-
-function recalcRow(tr){
-  const bags = Number(q(".itBags", tr).value || 0);
-  const net  = Number(q(".itNet", tr).value || 0);
-  const mode = q(".itMode", tr).value || "BAG";
-  const rate = Number(q(".itRate", tr).value || 0);
-
-  const amt = (mode==="BAG") ? (bags * rate) : (net * rate);
-  q(".itAmt", tr).value = amt.toFixed(2);
-
-  recalcGrandTotal();
-}
-
-function recalcGrandTotal(){
-  const sum = qa("#tmItemsTable tbody tr").reduce((a,tr)=>{
-    return a + Number(q(".itAmt", tr).value || 0);
-  }, 0);
-  $("tmGrandTotal").textContent = sum.toFixed(2);
-}
-
-function collectItemsFromUI(){
-  const rows = qa("#tmItemsTable tbody tr");
-  const items = rows.map(tr=>{
-    return {
-      id: tr.dataset.id,
-      productId: q(".itProduct", tr).value,
-      bags: Number(q(".itBags", tr).value || 0),
-      netMts: Number(q(".itNet", tr).value || 0),
-      rateMode: q(".itMode", tr).value || "BAG",
-      rate: Number(q(".itRate", tr).value || 0),
-      amount: Number(q(".itAmt", tr).value || 0)
-    };
-  }).filter(it => it.productId);
-  return items;
-}
-
-function memoTotals(memo){
-  const items = memo.items || [];
-  const bags = items.reduce((a,it)=>a+Number(it.bags||0),0);
-  const net  = items.reduce((a,it)=>a+Number(it.netMts||0),0);
-  const amt  = items.reduce((a,it)=>a+Number(it.amount||0),0);
-  return { bags, net, amt };
-}
-
-/* =========================
-   Truck Memo Form
-========================= */
-function nextMemoNo(){
-  const y = new Date().getFullYear();
-  const list = DB.truckMemos.filter(x => (x.memoNo||"").startsWith(`TM-${y}-`));
-  let max = 0;
-  for(const x of list){
-    const n = Number((x.memoNo||"").split("-")[2] || 0);
-    if(n>max) max=n;
-  }
-  return `TM-${y}-${String(max+1).padStart(4,"0")}`;
-}
-
-function prepareTruckForm(){
-  refreshDropdowns();
-  if(!$("tmDate").value) $("tmDate").value = todayISO();
-
-  // If coming from edit, do not wipe (edit loader handles)
-  if(editingMemoId) return;
-
-  // Reset items
-  q("#tmItemsTable tbody").innerHTML = "";
-  addItemRow();
-  $("tmGrandTotal").textContent = "0.00";
-  $("tmEditHint").textContent = "Creating new memo.";
-  $("btnSaveMemo").textContent = "Save Truck Memo";
-}
-
-$("btnClearTruck").onclick = ()=>{
-  editingMemoId = null;
-  lastPreviewMemoId = null;
-  q("#frmTruck").reset();
-  $("tmDate").value = todayISO();
-  q("#tmItemsTable tbody").innerHTML = "";
-  addItemRow();
-  $("tmGrandTotal").textContent = "0.00";
-  $("tmEditHint").textContent = "Creating new memo.";
-  $("btnSaveMemo").textContent = "Save Truck Memo";
-  $("previewArea").innerHTML = `<div class="muted">Create or select a memo from Reports, then preview here.</div>`;
-};
-
-q("#frmTruck").onsubmit = (e)=>{
-  e.preventDefault();
-
-  if(DB.millers.length===0 || DB.clients.length===0 || DB.products.length===0){
-    alert("Please create Master data first: Miller, Client, Product.");
-    return;
-  }
-
-  const items = collectItemsFromUI();
-  if(items.length === 0){
-    alert("Add at least 1 product row.");
-    return;
-  }
-
-  const memoBase = {
-    date: $("tmDate").value,
-    clientId: $("tmClient").value,
-    millerId: $("tmMiller").value,
-    vehicleNo: safeText($("tmVehicle").value),
-    driverName: safeText($("tmDriver").value),
-    mobile: safeText($("tmMobile").value),
-    items,
-    updatedAt: Date.now()
-  };
-
-  if(!memoBase.clientId || !memoBase.millerId){
-    alert("Please select Client and Miller.");
-    return;
-  }
-
-  if(editingMemoId){
-    const idx = DB.truckMemos.findIndex(x=>x.id===editingMemoId);
-    if(idx < 0){ alert("Memo not found."); return; }
-    DB.truckMemos[idx] = { ...DB.truckMemos[idx], ...memoBase };
-    saveDB(DB);
-    alert("Truck Memo updated.");
-    lastPreviewMemoId = editingMemoId;
-  } else {
-    const memo = {
-      id: uid("TM"),
-      memoNo: nextMemoNo(),
-      createdAt: Date.now(),
-      ...memoBase
-    };
-    DB.truckMemos.unshift(memo);
-    saveDB(DB);
-    alert(`Saved Truck Memo: ${memo.memoNo}`);
-    lastPreviewMemoId = memo.id;
-  }
-
-  editingMemoId = null;
-  $("tmEditHint").textContent = "Saved. You can preview/print now.";
-  $("btnSaveMemo").textContent = "Save Truck Memo";
-
-  renderDashboard();
-  prepareReports();
-};
-
-/* =========================
-   Preview / Print
-========================= */
-$("btnPreviewTruck").onclick = ()=>{
-  const memo = getSelectedMemo();
-  if(!memo){ alert("No memo found. Create one first."); return; }
-  $("previewArea").innerHTML = renderTruckMemoHTML(memo);
-  attachPrintButtons();
-};
-
-$("btnPreviewGate").onclick = ()=>{
-  const memo = getSelectedMemo();
-  if(!memo){ alert("No memo found. Create one first."); return; }
-  $("previewArea").innerHTML = renderGatePassHTML(memo);
-  attachPrintButtons();
-};
-
-function getSelectedMemo(){
-  if(lastPreviewMemoId){
-    const m = DB.truckMemos.find(x=>x.id===lastPreviewMemoId);
-    if(m) return m;
-  }
-  return DB.truckMemos[0] || null;
-}
-
-function printDoc(type){
-  const sheet = q(`.printSheet[data-doc="${type}"]`);
-  if(!sheet){ alert("No preview to print."); return; }
-
-  const w = window.open("", "_blank");
-  if(!w){ alert("Popup blocked. Allow popups for printing."); return; }
-
-  w.document.open();
-  w.document.write(`
-    <!doctype html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width,initial-scale=1">
-      <title>Print</title>
-      <link rel="stylesheet" href="./styles.css">
-      <style>
-        @page { margin: 0; }
-        body{ margin:0; }
-        .printSheet{ box-shadow:none !important; }
-      </style>
-    </head>
-    <body>
-      ${sheet.outerHTML}
-      <script>window.onload=()=>window.print();<\/script>
-    </body>
-    </html>
-  `);
-  w.document.close();
-}
-function attachPrintButtons(){
-  qa("[data-print]").forEach(btn=>{
-    btn.onclick = ()=> printDoc(btn.dataset.print);
-  });
-}
-
-/* Truck Memo A4 (NO rate/amount shown) */
-function renderTruckMemoHTML(memo){
-  const miller = DB.millers.find(x=>x.id===memo.millerId) || {};
-  const client = DB.clients.find(x=>x.id===memo.clientId) || {};
-
-  const logoHtml = miller.logo
-    ? `<img class="tm-logo" src="${miller.logo}" alt="Logo">`
-    : `<div class="tm-logo tm-logo-placeholder"></div>`;
-
-  const millerName = escapeHtml((miller.name||"").toUpperCase());
-  const millerAddr = escapeHtml(miller.address||"").replace(/\n/g,"<br>");
-
-  const clientName = escapeHtml(client.name||"");
-  const clientAddr = escapeHtml(client.address||"").replace(/\n/g,"<br>");
-
-  const rows = (memo.items||[]).map((it, idx)=>{
-    const prod = DB.products.find(p=>p.id===it.productId) || {};
-    return `
-      <tr>
-        <td>${idx+1}</td>
-        <td>${escapeHtml(prod.name||"")}</td>
-        <td>${Number(it.bags||0)}</td>
-        <td>${fmt3(it.netMts)}</td>
-      </tr>
-    `;
-  }).join("");
-
-  return `
-  <div class="noPrint" style="display:flex;gap:8px;margin-bottom:10px">
-    <button class="btn" data-print="tm">Print Truck Memo Only</button>
-  </div>
-
-  <div class="printSheet" data-doc="tm">
-    <div class="tm-letterhead">
-      <div class="tm-lh-left">${logoHtml}</div>
-      <div class="tm-lh-center">
-        <div class="tm-lh-name">${millerName}</div>
-        <div class="tm-lh-addr">${millerAddr}</div>
-      </div>
-      <div class="tm-lh-right">
-        <div class="tm-docTag">TRUCK MEMO</div>
-        <div class="tm-sub">
-          Memo No: <b>${escapeHtml(memo.memoNo)}</b><br>
-          Date: <b>${escapeHtml(memo.date)}</b>
-        </div>
-      </div>
-    </div>
-
-    <div class="tm-parties">
-      <div class="tm-box">
-        <div class="tm-box-title">CLIENT DETAILS</div>
-        <div><b>${clientName}</b></div>
-        <div>${clientAddr}</div>
-      </div>
-      <div class="tm-box">
-        <div class="tm-box-title">MILLER DETAILS</div>
-        <div><b>${escapeHtml(miller.name||"")}</b></div>
-        <div>${millerAddr}</div>
-      </div>
-    </div>
-
-    <table class="tm-info-table">
-      <tr>
-        <td><b>Vehicle No</b></td><td>${escapeHtml(memo.vehicleNo)}</td>
-        <td><b>Driver Name</b></td><td>${escapeHtml(memo.driverName)}</td>
-      </tr>
-      <tr>
-        <td><b>Mobile No</b></td><td>${escapeHtml(memo.mobile)}</td>
-        <td><b>Date</b></td><td>${escapeHtml(memo.date)}</td>
-      </tr>
-    </table>
-
-    <table class="tm-item-table">
-      <thead>
-        <tr>
-          <th>S.No</th>
-          <th>Commodity</th>
-          <th>No. of Bags</th>
-          <th>Net MTS</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows || `<tr><td colspan="4">No items</td></tr>`}
-      </tbody>
-    </table>
-
-    <div class="tm-footer">
-      <div class="tm-sign">Driver Signature</div>
-      <div class="tm-seal">
-        ${miller.seal ? `<img src="${miller.seal}" alt="Seal">` : ""}
-        <div class="tm-auth">Authorized Signatory</div>
-      </div>
-    </div>
-  </div>
-  `;
-}
-
-/* Gate Pass A5 landscape (shows totals only, still no rate/amount) */
-function renderGatePassHTML(memo){
-  const miller = DB.millers.find(x=>x.id===memo.millerId) || {};
-  const client = DB.clients.find(x=>x.id===memo.clientId) || {};
-  const t = memoTotals(memo);
-
-  const logoHtml = miller.logo
-    ? `<img class="tm-logo" src="${miller.logo}" alt="Logo">`
-    : `<div class="tm-logo tm-logo-placeholder"></div>`;
-
-  const millerName = escapeHtml((miller.name||"").toUpperCase());
-  const millerAddr = escapeHtml(miller.address||"").replace(/\n/g,"<br>");
-
-  return `
-  <div class="noPrint" style="display:flex;gap:8px;margin-bottom:10px">
-    <button class="btn" data-print="gp">Print Gate Pass Only</button>
-  </div>
-
-  <div class="printSheet gpLandscape" data-doc="gp">
-    <div class="tm-letterhead">
-      <div class="tm-lh-left">${logoHtml}</div>
-      <div class="tm-lh-center">
-        <div class="tm-lh-name">${millerName}</div>
-        <div class="tm-lh-addr">${millerAddr}</div>
-      </div>
-      <div class="tm-lh-right">
-        <div class="tm-docTag">GATE PASS</div>
-        <div class="tm-sub">
-          Ref: <b>${escapeHtml(memo.memoNo)}</b><br>
-          Date: <b>${escapeHtml(memo.date)}</b>
-        </div>
-      </div>
-    </div>
-
-    <table class="tm-info-table">
-      <tr>
-        <td><b>From (Miller)</b></td><td>${escapeHtml(miller.name||"")}</td>
-        <td><b>To (Client)</b></td><td>${escapeHtml(client.name||"")}</td>
-      </tr>
-      <tr>
-        <td><b>Vehicle</b></td><td>${escapeHtml(memo.vehicleNo)}</td>
-        <td><b>Driver / Mobile</b></td><td>${escapeHtml(memo.driverName)} / ${escapeHtml(memo.mobile)}</td>
-      </tr>
-      <tr>
-        <td><b>Total Bags</b></td><td>${t.bags}</td>
-        <td><b>Total Net MTS</b></td><td>${fmt3(t.net)}</td>
-      </tr>
-    </table>
-
-    <div class="tm-footer" style="margin-top:25mm">
-      <div class="tm-sign">Security / Gate Incharge</div>
-      <div class="tm-seal">
-        ${miller.seal ? `<img src="${miller.seal}" alt="Seal">` : ""}
-        <div class="tm-auth">Authorized Signatory</div>
-      </div>
-    </div>
-  </div>
-  `;
-}
-
-/* =========================
-   Reports
-========================= */
-function prepareReports(){
-  refreshDropdowns();
-  renderReportsTable(filterDocs());
-}
-
-$("btnApplyFilter").onclick = ()=> renderReportsTable(filterDocs());
-$("btnClearFilter").onclick = ()=>{
-  $("rFrom").value=""; $("rTo").value="";
-  $("rMiller").value=""; $("rClient").value="";
-  $("rProduct").value=""; $("rRateMode").value="";
-  $("rAmtMin").value=""; $("rAmtMax").value="";
-  renderReportsTable(filterDocs());
-};
-
-function filterDocs(){
-  const from = $("rFrom").value ? new Date($("rFrom").value).getTime() : null;
-  const to   = $("rTo").value ? (new Date($("rTo").value).getTime() + 86400000 - 1) : null;
-
-  const millerId = $("rMiller").value || "";
-  const clientId = $("rClient").value || "";
-  const productId = $("rProduct").value || "";
-  const rateMode = $("rRateMode").value || "";
-
-  const amtMin = $("rAmtMin").value ? Number($("rAmtMin").value) : null;
-  const amtMax = $("rAmtMax").value ? Number($("rAmtMax").value) : null;
-
-  return DB.truckMemos.filter(d=>{
-    const t = new Date(d.date).getTime();
-    if(from && t < from) return false;
-    if(to && t > to) return false;
-    if(millerId && d.millerId !== millerId) return false;
-    if(clientId && d.clientId !== clientId) return false;
-
-    const items = d.items || [];
-    if(productId && !items.some(it => it.productId === productId)) return false;
-    if(rateMode && !items.some(it => (it.rateMode||"") === rateMode)) return false;
-
-    const totalAmt = items.reduce((a,it)=>a+Number(it.amount||0),0);
-    if(amtMin !== null && totalAmt < amtMin) return false;
-    if(amtMax !== null && totalAmt > amtMax) return false;
-
-    return true;
-  });
-}
-
-function renderReportsTable(list){
-  const tb = q("#tblReports tbody");
-  tb.innerHTML = "";
-
-  list.forEach((m,i)=>{
-    const miller = DB.millers.find(x=>x.id===m.millerId) || {};
-    const client = DB.clients.find(x=>x.id===m.clientId) || {};
-    const t = memoTotals(m);
-
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${i+1}</td>
-      <td><b>${escapeHtml(m.memoNo)}</b></td>
-      <td>${escapeHtml(m.date)}</td>
-      <td>${escapeHtml(miller.name||"")}</td>
-      <td>${escapeHtml(client.name||"")}</td>
-      <td>${escapeHtml(m.vehicleNo||"")}</td>
-      <td style="text-align:right">${t.bags}</td>
-      <td style="text-align:right">${fmt3(t.net)}</td>
-      <td style="text-align:right">${t.amt.toFixed(2)}</td>
-      <td>
-        <div class="row gap8">
-          <button class="btn" data-act="tm">Truck</button>
-          <button class="btn" data-act="gp">Gate</button>
-          <button class="btn" data-act="edit">Edit</button>
-          <button class="btn danger" data-act="del">Delete</button>
-        </div>
-      </td>
-    `;
-
-    q('[data-act="tm"]', tr).onclick = ()=>{
-      lastPreviewMemoId = m.id;
-      go("truckmemo");
-      $("previewArea").innerHTML = renderTruckMemoHTML(m);
-      attachPrintButtons();
-    };
-
-    q('[data-act="gp"]', tr).onclick = ()=>{
-      lastPreviewMemoId = m.id;
-      go("truckmemo");
-      $("previewArea").innerHTML = renderGatePassHTML(m);
-      attachPrintButtons();
-    };
-
-    q('[data-act="edit"]', tr).onclick = ()=> loadMemoForEdit(m.id);
-    q('[data-act="del"]', tr).onclick = ()=> deleteTruckMemo(m.id);
-
-    tb.appendChild(tr);
-  });
-}
-
-function loadMemoForEdit(id){
-  const memo = DB.truckMemos.find(x=>x.id===id);
-  if(!memo){ alert("Memo not found"); return; }
-
-  editingMemoId = id;
-  lastPreviewMemoId = id;
-
-  go("truckmemo");
-  $("tmEditHint").textContent = `Editing: ${escapeHtml(memo.memoNo)} (Save will update)`;
-  $("btnSaveMemo").textContent = "Update Truck Memo";
-
-  $("tmDate").value = memo.date || todayISO();
-  $("tmClient").value = memo.clientId || "";
-  $("tmMiller").value = memo.millerId || "";
-  $("tmVehicle").value = memo.vehicleNo || "";
-  $("tmDriver").value = memo.driverName || "";
-  $("tmMobile").value = memo.mobile || "";
-
-  q("#tmItemsTable tbody").innerHTML = "";
-  (memo.items || []).forEach(it => addItemRow(it));
-  if((memo.items||[]).length === 0) addItemRow();
-  recalcGrandTotal();
-
-  $("previewArea").innerHTML = `<div class="muted">Editing memo. Click Preview to see printable format.</div>`;
-}
-
-function deleteTruckMemo(id){
-  const memo = DB.truckMemos.find(x=>x.id===id);
-  if(!memo) return;
-  if(!confirm(`Delete Truck Memo ${memo.memoNo}?`)) return;
-
-  DB.truckMemos = DB.truckMemos.filter(x=>x.id!==id);
-  saveDB(DB);
-
-  if(lastPreviewMemoId === id) lastPreviewMemoId = null;
-  if(editingMemoId === id) editingMemoId = null;
-
-  prepareReports();
-  renderDashboard();
-}
-
-/* =========================
-   CSV Export (Product-wise rows)
-========================= */
-function csvCell(v){
-  const s = (v ?? "").toString();
-  if(/[,"\n]/.test(s)) return `"${s.replace(/"/g,'""')}"`;
-  return s;
-}
-
-$("btnExportCSV").onclick = ()=>{
-  const memos = filterDocs();
-  const header = [
-    "MemoNo","Date","Commodity","ClientName","MillerName",
-    "VehicleNo","DriverName","Mobile",
-    "Bags","NetMTS","RateMode","Rate","Amount"
-  ];
-  const lines = [header.join(",")];
-
-  memos.forEach(m=>{
-    const miller = DB.millers.find(x=>x.id===m.millerId) || {};
-    const client = DB.clients.find(x=>x.id===m.clientId) || {};
-    (m.items||[]).forEach(it=>{
-      const prod = DB.products.find(x=>x.id===it.productId) || {};
-      const row = [
-        m.memoNo, m.date, prod.name||"",
-        client.name||"", miller.name||"",
-        m.vehicleNo, m.driverName, m.mobile,
-        it.bags, it.netMts,
-        it.rateMode, it.rate, it.amount
-      ].map(csvCell);
-      lines.push(row.join(","));
-    });
-  });
-
-  const blob = new Blob([lines.join("\n")], {type:"text/csv;charset=utf-8"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `TruckMemo_Report_${todayISO()}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
-};
-
-/* =========================
-   Backup Export/Import
-========================= */
-function exportBackup(){
-  const payload = { version: 1, exportedAt: new Date().toISOString(), db: DB };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type:"application/json;charset=utf-8" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `MillerManagement_Backup_${todayISO()}.json`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
-}
-
-async function importBackupFile(file){
-  try{
-    const text = await file.text();
-    const data = JSON.parse(text);
-    if(!data || !data.db) throw new Error("Invalid backup file");
-    const newDB = data.db;
-    if(!newDB.millers || !newDB.clients || !newDB.products || !newDB.truckMemos){
-      throw new Error("Backup missing required fields");
+async function waitForLogin() {
+  showLogin();
+
+  supabase.auth.onAuthStateChange(async (event, session) => {
+    if (session && session.user) {
+      hideLogin();
+      await loadAllFromSupabase();
+      startApp();
+    } else {
+      showLogin();
     }
-    DB = newDB;
-    saveDB(DB);
+  });
 
-    normalizeMemos();
-    refreshDropdowns();
-    renderDashboard();
+  // immediate check
+  const { data } = await supabase.auth.getUser();
+  if (data?.user) {
+    hideLogin();
+    await loadAllFromSupabase();
+    startApp();
+  }
+}
+
+/* =========================
+   SUPABASE LOADERS
+========================= */
+async function loadTable(name) {
+  const { data, error } = await supabase
+    .from(name)
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  if (error) throw error;
+  return data || [];
+}
+
+async function loadAllFromSupabase() {
+  const [m, c, p, t] = await Promise.all([
+    loadTable("millers"),
+    loadTable("clients"),
+    loadTable("products"),
+    loadTable("truck_memos")
+  ]);
+
+  DB.millers = m;
+  DB.clients = c;
+  DB.products = p;
+  DB.truckMemos = t;
+}
+
+/* =========================
+   APP START
+========================= */
+function startApp() {
+  console.log("✅ Logged in & data loaded");
+  if ($("tmDate")) $("tmDate").value = todayISO();
+}
+/* =========================================================
+   PART 2/4 – Masters CRUD (Miller / Client / Product)
+   ========================================================= */
+
+/* =========================
+   SIMPLE TOAST / ALERT
+========================= */
+function toast(msg) {
+  alert(msg);
+}
+
+/* =========================
+   SUPABASE WRITE HELPERS
+========================= */
+async function currentUser() {
+  const { data } = await supabase.auth.getUser();
+  return data?.user || null;
+}
+
+async function upsertRow(table, row) {
+  const { error } = await supabase.from(table).upsert(row, { onConflict: "id" });
+  if (error) throw error;
+}
+
+async function deleteRow(table, id) {
+  const { error } = await supabase.from(table).delete().eq("id", id);
+  if (error) throw error;
+}
+
+/* =========================
+   RENDER MASTER TABLES
+   (Requires your HTML tables to exist:
+    #tblMillers, #tblClients, #tblProducts)
+========================= */
+function renderMillers() {
+  const tbl = $("tblMillers");
+  if (!tbl) return;
+
+  const tbody = tbl.querySelector("tbody");
+  tbody.innerHTML = "";
+
+  DB.millers.forEach((m) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(m.name || "")}</td>
+      <td>${escapeHtml(m.mobile || "")}</td>
+      <td>${escapeHtml(m.address || "")}</td>
+      <td style="text-align:center; white-space:nowrap;">
+        <button data-edit="${m.id}">Edit</button>
+        <button data-del="${m.id}">Delete</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("button[data-edit]").forEach((btn) => {
+    btn.onclick = () => openMillerEdit(btn.getAttribute("data-edit"));
+  });
+  tbody.querySelectorAll("button[data-del]").forEach((btn) => {
+    btn.onclick = () => removeMiller(btn.getAttribute("data-del"));
+  });
+}
+
+function renderClients() {
+  const tbl = $("tblClients");
+  if (!tbl) return;
+
+  const tbody = tbl.querySelector("tbody");
+  tbody.innerHTML = "";
+
+  DB.clients.forEach((c) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(c.name || "")}</td>
+      <td>${escapeHtml(c.mobile || "")}</td>
+      <td>${escapeHtml(c.address || "")}</td>
+      <td style="text-align:center; white-space:nowrap;">
+        <button data-edit="${c.id}">Edit</button>
+        <button data-del="${c.id}">Delete</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("button[data-edit]").forEach((btn) => {
+    btn.onclick = () => openClientEdit(btn.getAttribute("data-edit"));
+  });
+  tbody.querySelectorAll("button[data-del]").forEach((btn) => {
+    btn.onclick = () => removeClient(btn.getAttribute("data-del"));
+  });
+}
+
+function renderProducts() {
+  const tbl = $("tblProducts");
+  if (!tbl) return;
+
+  const tbody = tbl.querySelector("tbody");
+  tbody.innerHTML = "";
+
+  DB.products.forEach((p) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(p.name || "")}</td>
+      <td>${escapeHtml(p.hsn || "")}</td>
+      <td style="text-align:center; white-space:nowrap;">
+        <button data-edit="${p.id}">Edit</button>
+        <button data-del="${p.id}">Delete</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("button[data-edit]").forEach((btn) => {
+    btn.onclick = () => openProductEdit(btn.getAttribute("data-edit"));
+  });
+  tbody.querySelectorAll("button[data-del]").forEach((btn) => {
+    btn.onclick = () => removeProduct(btn.getAttribute("data-del"));
+  });
+}
+
+/* =========================
+   ESCAPE HTML (security)
+========================= */
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+/* =========================
+   MILLER CRUD
+   (HTML inputs expected:
+    #millerName #millerMobile #millerAddress
+    buttons: #btnSaveMiller #btnClearMiller
+========================= */
+let editMillerId = null;
+
+function bindMillerEvents() {
+  if ($("btnSaveMiller")) $("btnSaveMiller").onclick = saveMiller;
+  if ($("btnClearMiller")) $("btnClearMiller").onclick = clearMillerForm;
+}
+
+function clearMillerForm() {
+  editMillerId = null;
+  if ($("millerName")) $("millerName").value = "";
+  if ($("millerMobile")) $("millerMobile").value = "";
+  if ($("millerAddress")) $("millerAddress").value = "";
+}
+
+function openMillerEdit(id) {
+  const m = DB.millers.find((x) => x.id === id);
+  if (!m) return;
+
+  editMillerId = id;
+  if ($("millerName")) $("millerName").value = m.name || "";
+  if ($("millerMobile")) $("millerMobile").value = m.mobile || "";
+  if ($("millerAddress")) $("millerAddress").value = m.address || "";
+}
+
+async function saveMiller() {
+  try {
+    const user = await currentUser();
+    if (!user) return toast("Login required");
+
+    const name = ($("millerName")?.value || "").trim();
+    const mobile = ($("millerMobile")?.value || "").trim();
+    const address = ($("millerAddress")?.value || "").trim();
+
+    if (!name) return toast("Enter Miller Name");
+
+    const row = {
+      id: editMillerId || uid("MIL"),
+      user_id: user.id,
+      name,
+      mobile: mobile || null,
+      address: address || null,
+      updated_at: new Date().toISOString()
+    };
+
+    await upsertRow("millers", row);
+
+    // update local cache
+    const ix = DB.millers.findIndex((x) => x.id === row.id);
+    if (ix >= 0) DB.millers[ix] = { ...DB.millers[ix], ...row };
+    else DB.millers.unshift(row);
+
     renderMillers();
-    renderClients();
-    renderProducts();
-    prepareReports();
-
-    alert("Backup imported successfully.");
-  }catch(err){
-    alert("Import failed: " + err.message);
+    refreshDropdowns();
+    clearMillerForm();
+    toast("Miller saved");
+  } catch (e) {
+    toast(e.message || String(e));
   }
 }
 
-$("btnExportBackup").onclick = exportBackup;
-$("btnImportBackup").onclick = ()=> $("inpImportBackup").click();
-$("inpImportBackup").addEventListener("change", async (e)=>{
-  const file = e.target.files?.[0];
-  if(!file) return;
-  await importBackupFile(file);
-  e.target.value = "";
-});
+async function removeMiller(id) {
+  if (!confirm("Delete this Miller?")) return;
+  try {
+    await deleteRow("millers", id);
+    DB.millers = DB.millers.filter((x) => x.id !== id);
+    renderMillers();
+    refreshDropdowns();
+    toast("Miller deleted");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
 
 /* =========================
-   Report PDF (Bank statement style)
-   - Option: With or without rate/amount
+   CLIENT CRUD
+   (HTML inputs expected:
+    #clientName #clientMobile #clientAddress
+    buttons: #btnSaveClient #btnClearClient
 ========================= */
-function buildReportStatementHTML(memos, includeRateAmt){
-  const from = $("rFrom").value || "—";
-  const to = $("rTo").value || "—";
-  const millerId = $("rMiller").value || "";
-  const clientId = $("rClient").value || "";
-  const productId = $("rProduct").value || "";
-  const rateMode = $("rRateMode").value || "";
+let editClientId = null;
 
-  const millerName = millerId ? (DB.millers.find(x=>x.id===millerId)?.name || "") : "All";
-  const clientName = clientId ? (DB.clients.find(x=>x.id===clientId)?.name || "") : "All";
-  const productName = productId ? (DB.products.find(x=>x.id===productId)?.name || "") : "All";
+function bindClientEvents() {
+  if ($("btnSaveClient")) $("btnSaveClient").onclick = saveClient;
+  if ($("btnClearClient")) $("btnClearClient").onclick = clearClientForm;
+}
 
-  let rows = [];
-  memos.forEach(m=>{
-    const miller = DB.millers.find(x=>x.id===m.millerId) || {};
-    const client = DB.clients.find(x=>x.id===m.clientId) || {};
-    (m.items||[]).forEach(it=>{
-      const prod = DB.products.find(x=>x.id===it.productId) || {};
-      rows.push({
-        memoNo: m.memoNo,
-        date: m.date,
-        commodity: prod.name || "",
-        client: client.name || "",
-        miller: miller.name || "",
-        vehicle: m.vehicleNo || "",
-        bags: Number(it.bags || 0),
-        netMts: Number(it.netMts || 0),
-        rateMode: it.rateMode || "",
-        rate: Number(it.rate || 0),
-        amount: Number(it.amount || 0),
+function clearClientForm() {
+  editClientId = null;
+  if ($("clientName")) $("clientName").value = "";
+  if ($("clientMobile")) $("clientMobile").value = "";
+  if ($("clientAddress")) $("clientAddress").value = "";
+}
+
+function openClientEdit(id) {
+  const c = DB.clients.find((x) => x.id === id);
+  if (!c) return;
+
+  editClientId = id;
+  if ($("clientName")) $("clientName").value = c.name || "";
+  if ($("clientMobile")) $("clientMobile").value = c.mobile || "";
+  if ($("clientAddress")) $("clientAddress").value = c.address || "";
+}
+
+async function saveClient() {
+  try {
+    const user = await currentUser();
+    if (!user) return toast("Login required");
+
+    const name = ($("clientName")?.value || "").trim();
+    const mobile = ($("clientMobile")?.value || "").trim();
+    const address = ($("clientAddress")?.value || "").trim();
+
+    if (!name) return toast("Enter Client Name");
+
+    const row = {
+      id: editClientId || uid("CLI"),
+      user_id: user.id,
+      name,
+      mobile: mobile || null,
+      address: address || null,
+      updated_at: new Date().toISOString()
+    };
+
+    await upsertRow("clients", row);
+
+    const ix = DB.clients.findIndex((x) => x.id === row.id);
+    if (ix >= 0) DB.clients[ix] = { ...DB.clients[ix], ...row };
+    else DB.clients.unshift(row);
+
+    renderClients();
+    refreshDropdowns();
+    clearClientForm();
+    toast("Client saved");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+async function removeClient(id) {
+  if (!confirm("Delete this Client?")) return;
+  try {
+    await deleteRow("clients", id);
+    DB.clients = DB.clients.filter((x) => x.id !== id);
+    renderClients();
+    refreshDropdowns();
+    toast("Client deleted");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+/* =========================
+   PRODUCT CRUD
+   (HTML inputs expected:
+    #prodName #prodHSN
+    buttons: #btnSaveProduct #btnClearProduct
+========================= */
+let editProductId = null;
+
+function bindProductEvents() {
+  if ($("btnSaveProduct")) $("btnSaveProduct").onclick = saveProduct;
+  if ($("btnClearProduct")) $("btnClearProduct").onclick = clearProductForm;
+}
+
+function clearProductForm() {
+  editProductId = null;
+  if ($("prodName")) $("prodName").value = "";
+  if ($("prodHSN")) $("prodHSN").value = "";
+}
+
+function openProductEdit(id) {
+  const p = DB.products.find((x) => x.id === id);
+  if (!p) return;
+
+  editProductId = id;
+  if ($("prodName")) $("prodName").value = p.name || "";
+  if ($("prodHSN")) $("prodHSN").value = p.hsn || "";
+}
+
+async function saveProduct() {
+  try {
+    const user = await currentUser();
+    if (!user) return toast("Login required");
+
+    const name = ($("prodName")?.value || "").trim();
+    const hsn = ($("prodHSN")?.value || "").trim();
+
+    if (!name) return toast("Enter Product/Commodity Name");
+
+    const row = {
+      id: editProductId || uid("PRD"),
+      user_id: user.id,
+      name,
+      hsn: hsn || null,
+      updated_at: new Date().toISOString()
+    };
+
+    await upsertRow("products", row);
+
+    const ix = DB.products.findIndex((x) => x.id === row.id);
+    if (ix >= 0) DB.products[ix] = { ...DB.products[ix], ...row };
+    else DB.products.unshift(row);
+
+    renderProducts();
+    refreshDropdowns();
+    clearProductForm();
+    toast("Product saved");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+async function removeProduct(id) {
+  if (!confirm("Delete this Product?")) return;
+  try {
+    await deleteRow("products", id);
+    DB.products = DB.products.filter((x) => x.id !== id);
+    renderProducts();
+    refreshDropdowns();
+    toast("Product deleted");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+/* =========================
+   DROPDOWN REFRESH
+   (Used by Truck Memo page)
+   Expected selects:
+   #tmMiller, #tmClient
+========================= */
+function refreshDropdowns() {
+  const millerSel = $("tmMiller");
+  if (millerSel) {
+    millerSel.innerHTML = `<option value="">Select Miller</option>`;
+    DB.millers
+      .slice()
+      .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+      .forEach((m) => {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = m.name;
+        millerSel.appendChild(opt);
       });
-    });
-  });
+  }
 
-  const totalBags = rows.reduce((a,r)=>a+r.bags,0);
-  const totalNet = rows.reduce((a,r)=>a+r.netMts,0);
-  const totalAmt = rows.reduce((a,r)=>a+r.amount,0);
-
-  const badge = includeRateAmt ? "WITH RATE & AMOUNT" : "WITHOUT RATE & AMOUNT";
-  const headCols = includeRateAmt
-    ? `<th>#</th><th>Date</th><th>Memo No</th><th>Commodity</th><th>Bags</th><th>Net MTS</th><th>Rate Mode</th><th>Rate</th><th>Amount</th><th>Vehicle</th><th>Client</th><th>Miller</th>`
-    : `<th>#</th><th>Date</th><th>Memo No</th><th>Commodity</th><th>Bags</th><th>Net MTS</th><th>Vehicle</th><th>Client</th><th>Miller</th>`;
-
-  const bodyRows = rows.map((r,i)=>{
-    if(includeRateAmt){
-      return `
-        <tr>
-          <td>${i+1}</td>
-          <td>${escapeHtml(r.date)}</td>
-          <td>${escapeHtml(r.memoNo)}</td>
-          <td>${escapeHtml(r.commodity)}</td>
-          <td style="text-align:right">${r.bags}</td>
-          <td style="text-align:right">${fmt3(r.netMts)}</td>
-          <td style="text-align:center">${escapeHtml(r.rateMode)}</td>
-          <td style="text-align:right">${r.rate.toFixed(2)}</td>
-          <td style="text-align:right">${r.amount.toFixed(2)}</td>
-          <td>${escapeHtml(r.vehicle)}</td>
-          <td>${escapeHtml(r.client)}</td>
-          <td>${escapeHtml(r.miller)}</td>
-        </tr>
-      `;
-    }
-    return `
-      <tr>
-        <td>${i+1}</td>
-        <td>${escapeHtml(r.date)}</td>
-        <td>${escapeHtml(r.memoNo)}</td>
-        <td>${escapeHtml(r.commodity)}</td>
-        <td style="text-align:right">${r.bags}</td>
-        <td style="text-align:right">${fmt3(r.netMts)}</td>
-        <td>${escapeHtml(r.vehicle)}</td>
-        <td>${escapeHtml(r.client)}</td>
-        <td>${escapeHtml(r.miller)}</td>
-      </tr>
-    `;
-  }).join("");
-
-  return `
-  <div class="statementSheet">
-    <div class="st-header">
-      <div>
-        <div class="st-title">REPORT STATEMENT</div>
-        <div class="st-sub">
-          Date Range: <b>${escapeHtml(from)}</b> to <b>${escapeHtml(to)}</b><br>
-          Miller: <b>${escapeHtml(millerName)}</b> • Client: <b>${escapeHtml(clientName)}</b><br>
-          Product: <b>${escapeHtml(productName)}</b> • Rate Mode: <b>${escapeHtml(rateMode || "All")}</b>
-        </div>
-      </div>
-      <div class="st-meta">
-        <span class="st-badge">${badge}</span><br>
-        Generated: <b>${new Date().toLocaleString()}</b><br>
-        Rows: <b>${rows.length}</b>
-      </div>
-    </div>
-
-    <table class="st-table">
-      <thead><tr>${headCols}</tr></thead>
-      <tbody>
-        ${bodyRows || `<tr><td colspan="12">No records found</td></tr>`}
-      </tbody>
-    </table>
-
-    <div class="st-footer">
-      <div class="st-summary">
-        <h3>SUMMARY</h3>
-        <div class="rowline"><span>Total Bags</span><b>${totalBags}</b></div>
-        <div class="rowline"><span>Total Net MTS</span><b>${fmt3(totalNet)}</b></div>
-        ${includeRateAmt ? `<div class="rowline"><span>Total Amount</span><b>${totalAmt.toFixed(2)}</b></div>` : ``}
-      </div>
-
-      <div style="width:40%;border:1px solid #111;padding:6mm">
-        <div style="font-weight:900;letter-spacing:.6px;font-size:12px;margin-bottom:6mm">AUTHORIZATION</div>
-        <div style="border-top:1px solid #111;padding-top:6mm;text-align:center;font-size:11px">Authorized Signatory</div>
-      </div>
-    </div>
-  </div>
-  `;
-}
-
-function printStatementAsPDF(html){
-  const w = window.open("", "_blank");
-  if(!w){ alert("Popup blocked. Allow popups for PDF."); return; }
-
-  w.document.open();
-  w.document.write(`
-    <!doctype html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width,initial-scale=1">
-      <title>Report PDF</title>
-      <link rel="stylesheet" href="./styles.css">
-      <style>
-        @page { size: A4; margin: 8mm; }
-        body{ margin:0; background:#fff; }
-      </style>
-    </head>
-    <body>
-      ${html}
-      <script>window.onload=()=>window.print();<\/script>
-    </body>
-    </html>
-  `);
-  w.document.close();
-}
-
-$("btnReportPDF").onclick = ()=>{
-  const includeRateAmt = $("rIncludeRateAmt").checked;
-  const memos = filterDocs();
-  const html = buildReportStatementHTML(memos, includeRateAmt);
-  printStatementAsPDF(html);
-};
-
-/* =========================
-   Dashboard
-========================= */
-function renderDashboard(){
-  $("dashTruckCount").textContent = DB.truckMemos.length;
-  $("dashGateCount").textContent = DB.truckMemos.length;
-
-  let sumNet = 0;
-  DB.truckMemos.forEach(m=>{
-    sumNet += memoTotals(m).net;
-  });
-  $("dashNetMts").textContent = fmt3(sumNet);
-
-  const tb = q("#dashRecentTable tbody");
-  tb.innerHTML = "";
-  DB.truckMemos.slice(0,8).forEach((m,i)=>{
-    const miller = DB.millers.find(x=>x.id===m.millerId) || {};
-    const client = DB.clients.find(x=>x.id===m.clientId) || {};
-    const t = memoTotals(m);
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${i+1}</td>
-      <td><b>${escapeHtml(m.memoNo)}</b></td>
-      <td>${escapeHtml(m.date)}</td>
-      <td>${escapeHtml(miller.name||"")}</td>
-      <td>${escapeHtml(client.name||"")}</td>
-      <td>${escapeHtml(m.vehicleNo||"")}</td>
-      <td style="text-align:right">${t.bags}</td>
-      <td style="text-align:right">${fmt3(t.net)}</td>
-    `;
-    tb.appendChild(tr);
-  });
+  const clientSel = $("tmClient");
+  if (clientSel) {
+    clientSel.innerHTML = `<option value="">Select Client</option>`;
+    DB.clients
+      .slice()
+      .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+      .forEach((c) => {
+        const opt = document.createElement("option");
+        opt.value = c.id;
+        opt.textContent = c.name;
+        clientSel.appendChild(opt);
+      });
+  }
 }
 
 /* =========================
-   Reset
+   START APP - EXTEND
 ========================= */
-$("btnReset").onclick = ()=>{
-  if(!confirm("Reset ALL data? This will delete Masters and Documents.")) return;
-  localStorage.removeItem(DB_KEY);
-  DB = loadDB();
-  normalizeMemos();
-  editingMemoId = null;
-  lastPreviewMemoId = null;
+const _startAppOld = startApp;
+startApp = function () {
+  _startAppOld();
 
-  refreshDropdowns();
-  renderDashboard();
+  // bind master buttons
+  bindMillerEvents();
+  bindClientEvents();
+  bindProductEvents();
+
+  // render master lists
   renderMillers();
   renderClients();
   renderProducts();
-  prepareReports();
 
-  $("previewArea").innerHTML = `<div class="muted">Create or select a memo from Reports, then preview here.</div>`;
-  alert("Reset done.");
+  refreshDropdowns();
 };
+/* =========================================================
+   PART 3/4 – Truck Memo + Gate Pass + Save/Edit/Delete
+   ========================================================= */
 
 /* =========================
-   Init
+   TRUCK MEMO UI EXPECTED IDs
+   Inputs:
+   #tmDate #tmMemoNo #tmMiller #tmClient #tmVehicle #tmDriver #tmMobile
+   Table:
+   #tmItemsTable (tbody) with columns:
+     Product(select) | Bags | NetMTS | RateMode(select) | Rate | Amount | Action
+   Buttons:
+   #btnAddItemRow #btnSaveTruckMemo #btnClearTruckMemo
+   Memo list table:
+   #tblTruckMemos (tbody)
 ========================= */
-function init(){
-  normalizeMemos();
-  refreshDropdowns();
 
-  $("tmDate").value = todayISO();
-  q("#tmItemsTable tbody").innerHTML = "";
-  addItemRow();
+let editMemoId = null;
 
-  renderDashboard();
-  go("dashboard");
+function bindTruckMemoEvents() {
+  if ($("btnAddItemRow")) $("btnAddItemRow").onclick = addItemRow;
+  if ($("btnSaveTruckMemo")) $("btnSaveTruckMemo").onclick = saveTruckMemo;
+  if ($("btnClearTruckMemo")) $("btnClearTruckMemo").onclick = clearTruckMemoForm;
+
+  // If you have a memo list render button, ignore.
 }
-init();
+
+function getProductOptionsHTML(selectedId = "") {
+  const opts = DB.products
+    .slice()
+    .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+    .map((p) => {
+      const sel = p.id === selectedId ? "selected" : "";
+      return `<option value="${p.id}" ${sel}>${escapeHtml(p.name)}</option>`;
+    })
+    .join("");
+  return `<option value="">Select</option>${opts}`;
+}
+
+function addItemRow(prefill = null) {
+  const table = $("tmItemsTable");
+  if (!table) return;
+
+  const tbody = table.querySelector("tbody") || table;
+  const rowId = uid("ROW");
+
+  const productId = prefill?.productId || "";
+  const bags = prefill?.bags ?? "";
+  const netMts = prefill?.netMts ?? "";
+  const rateMode = prefill?.rateMode || "BAG"; // BAG or MTS
+  const rate = prefill?.rate ?? "";
+  const amount = prefill?.amount ?? "";
+
+  const tr = document.createElement("tr");
+  tr.setAttribute("data-rowid", rowId);
+
+  tr.innerHTML = `
+    <td>
+      <select class="itmProduct" style="width:100%">${getProductOptionsHTML(productId)}</select>
+    </td>
+    <td><input class="itmBags" type="number" min="0" step="1" value="${bags}" style="width:100%"></td>
+    <td><input class="itmMts" type="number" min="0" step="0.001" value="${netMts}" style="width:100%"></td>
+    <td>
+      <select class="itmMode" style="width:100%">
+        <option value="BAG" ${rateMode === "BAG" ? "selected" : ""}>Per Bag</option>
+        <option value="MTS" ${rateMode === "MTS" ? "selected" : ""}>Per MTS</option>
+      </select>
+    </td>
+    <td><input class="itmRate" type="number" min="0" step="0.01" value="${rate}" style="width:100%"></td>
+    <td><input class="itmAmt" type="number" min="0" step="0.01" value="${amount}" style="width:100%" readonly></td>
+    <td style="text-align:center">
+      <button class="itmDel">X</button>
+    </td>
+  `;
+
+  tbody.appendChild(tr);
+
+  // bind calc events
+  const recalc = () => recalcRow(tr);
+  tr.querySelector(".itmBags").addEventListener("input", recalc);
+  tr.querySelector(".itmMts").addEventListener("input", recalc);
+  tr.querySelector(".itmMode").addEventListener("change", recalc);
+  tr.querySelector(".itmRate").addEventListener("input", recalc);
+
+  tr.querySelector(".itmDel").onclick = () => {
+    tr.remove();
+    recalcTotals();
+  };
+
+  recalcRow(tr);
+}
+
+function recalcRow(tr) {
+  const bags = parseFloat(tr.querySelector(".itmBags").value || "0") || 0;
+  const mts = parseFloat(tr.querySelector(".itmMts").value || "0") || 0;
+  const mode = tr.querySelector(".itmMode").value;
+  const rate = parseFloat(tr.querySelector(".itmRate").value || "0") || 0;
+
+  const qty = mode === "BAG" ? bags : mts;
+  const amt = qty * rate;
+
+  tr.querySelector(".itmAmt").value = amt ? amt.toFixed(2) : "0.00";
+  recalcTotals();
+}
+
+function recalcTotals() {
+  let totalBags = 0;
+  let totalMts = 0;
+  let totalAmt = 0;
+
+  const table = $("tmItemsTable");
+  if (!table) return;
+
+  const tbody = table.querySelector("tbody") || table;
+  const rows = Array.from(tbody.querySelectorAll("tr"));
+
+  rows.forEach((tr) => {
+    totalBags += parseFloat(tr.querySelector(".itmBags").value || "0") || 0;
+    totalMts += parseFloat(tr.querySelector(".itmMts").value || "0") || 0;
+    totalAmt += parseFloat(tr.querySelector(".itmAmt").value || "0") || 0;
+  });
+
+  if ($("tmTotalBags")) $("tmTotalBags").textContent = totalBags.toFixed(0);
+  if ($("tmTotalMts")) $("tmTotalMts").textContent = totalMts.toFixed(3);
+  if ($("tmTotalAmt")) $("tmTotalAmt").textContent = totalAmt.toFixed(2);
+}
+
+function getItemsFromUI() {
+  const table = $("tmItemsTable");
+  const tbody = table.querySelector("tbody") || table;
+  const rows = Array.from(tbody.querySelectorAll("tr"));
+
+  const items = rows
+    .map((tr) => {
+      const productId = tr.querySelector(".itmProduct").value;
+      const bags = parseFloat(tr.querySelector(".itmBags").value || "0") || 0;
+      const netMts = parseFloat(tr.querySelector(".itmMts").value || "0") || 0;
+      const rateMode = tr.querySelector(".itmMode").value;
+      const rate = parseFloat(tr.querySelector(".itmRate").value || "0") || 0;
+      const amount = parseFloat(tr.querySelector(".itmAmt").value || "0") || 0;
+
+      if (!productId) return null;
+      return { productId, bags, netMts, rateMode, rate, amount };
+    })
+    .filter(Boolean);
+
+  return items;
+}
+
+function clearTruckMemoForm() {
+  editMemoId = null;
+  if ($("tmDate")) $("tmDate").value = todayISO();
+  if ($("tmMemoNo")) $("tmMemoNo").value = "";
+  if ($("tmMiller")) $("tmMiller").value = "";
+  if ($("tmClient")) $("tmClient").value = "";
+  if ($("tmVehicle")) $("tmVehicle").value = "";
+  if ($("tmDriver")) $("tmDriver").value = "";
+  if ($("tmMobile")) $("tmMobile").value = "";
+
+  // clear table rows
+  const table = $("tmItemsTable");
+  if (table) {
+    const tbody = table.querySelector("tbody") || table;
+    tbody.innerHTML = "";
+  }
+  addItemRow();
+  recalcTotals();
+}
+
+async function saveTruckMemo() {
+  try {
+    const user = await currentUser();
+    if (!user) return toast("Login required");
+
+    const memoNo = ($("tmMemoNo")?.value || "").trim();
+    const memoDate = ($("tmDate")?.value || "").trim();
+    const millerId = ($("tmMiller")?.value || "").trim();
+    const clientId = ($("tmClient")?.value || "").trim();
+
+    if (!memoDate) return toast("Select date");
+    if (!millerId) return toast("Select miller");
+    if (!clientId) return toast("Select client");
+    if (!memoNo) return toast("Enter Truck Memo No");
+
+    const vehicleNo = ($("tmVehicle")?.value || "").trim();
+    const driverName = ($("tmDriver")?.value || "").trim();
+    const mobile = ($("tmMobile")?.value || "").trim();
+
+    const items = getItemsFromUI();
+    if (items.length === 0) return toast("Add at least one product row");
+
+    const row = {
+      id: editMemoId || uid("TM"),
+      user_id: user.id,
+      memo_no: memoNo,
+      memo_date: memoDate,
+      miller_id: millerId,
+      client_id: clientId,
+      vehicle_no: vehicleNo || null,
+      driver_name: driverName || null,
+      mobile: mobile || null,
+      items: items,
+      updated_at: new Date().toISOString()
+    };
+
+    await upsertRow("truck_memos", row);
+
+    const ix = DB.truckMemos.findIndex((x) => x.id === row.id);
+    if (ix >= 0) DB.truckMemos[ix] = { ...DB.truckMemos[ix], ...row };
+    else DB.truckMemos.unshift(row);
+
+    renderTruckMemos();
+    clearTruckMemoForm();
+    toast("Truck Memo saved");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+async function deleteTruckMemo(id) {
+  if (!confirm("Delete this Truck Memo?")) return;
+  try {
+    await deleteRow("truck_memos", id);
+    DB.truckMemos = DB.truckMemos.filter((x) => x.id !== id);
+    renderTruckMemos();
+    toast("Truck Memo deleted");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+function openTruckMemoEdit(id) {
+  const m = DB.truckMemos.find((x) => x.id === id);
+  if (!m) return;
+
+  editMemoId = id;
+  if ($("tmMemoNo")) $("tmMemoNo").value = m.memo_no || "";
+  if ($("tmDate")) $("tmDate").value = m.memo_date || todayISO();
+  if ($("tmMiller")) $("tmMiller").value = m.miller_id || "";
+  if ($("tmClient")) $("tmClient").value = m.client_id || "";
+  if ($("tmVehicle")) $("tmVehicle").value = m.vehicle_no || "";
+  if ($("tmDriver")) $("tmDriver").value = m.driver_name || "";
+  if ($("tmMobile")) $("tmMobile").value = m.mobile || "";
+
+  // fill items
+  const table = $("tmItemsTable");
+  if (table) {
+    const tbody = table.querySelector("tbody") || table;
+    tbody.innerHTML = "";
+    (m.items || []).forEach((it) => addItemRow(it));
+  }
+  recalcTotals();
+}
+
+function renderTruckMemos() {
+  const tbl = $("tblTruckMemos");
+  if (!tbl) return;
+
+  const tbody = tbl.querySelector("tbody");
+  tbody.innerHTML = "";
+
+  DB.truckMemos.forEach((m) => {
+    const miller = DB.millers.find((x) => x.id === m.miller_id);
+    const client = DB.clients.find((x) => x.id === m.client_id);
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(m.memo_no || "")}</td>
+      <td>${escapeHtml(m.memo_date || "")}</td>
+      <td>${escapeHtml(miller?.name || "")}</td>
+      <td>${escapeHtml(client?.name || "")}</td>
+      <td style="text-align:center; white-space:nowrap;">
+        <button data-edit="${m.id}">Edit</button>
+        <button data-print="${m.id}">Print</button>
+        <button data-gate="${m.id}">Gate Pass</button>
+        <button data-del="${m.id}">Delete</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("button[data-edit]").forEach((b) => {
+    b.onclick = () => openTruckMemoEdit(b.getAttribute("data-edit"));
+  });
+  tbody.querySelectorAll("button[data-del]").forEach((b) => {
+    b.onclick = () => deleteTruckMemo(b.getAttribute("data-del"));
+  });
+  tbody.querySelectorAll("button[data-print]").forEach((b) => {
+    b.onclick = () => printTruckMemoOnly(b.getAttribute("data-print"));
+  });
+  tbody.querySelectorAll("button[data-gate]").forEach((b) => {
+    b.onclick = () => printGatePassOnly(b.getAttribute("data-gate"));
+  });
+}
+
+/* =========================
+   PRINT ONLY A SECTION (NOT FULL PAGE)
+========================= */
+function openPrintWindow(html, title = "Print") {
+  const w = window.open("", "_blank", "width=980,height=720");
+  w.document.open();
+  w.document.write(`
+    <html>
+      <head>
+        <title>${escapeHtml(title)}</title>
+        <style>
+          body{font-family:Arial, sans-serif; margin:0; padding:0;}
+          @page{ margin:12mm; }
+          .a4{ width:210mm; min-height:297mm; padding:12mm; box-sizing:border-box; }
+          .land45{ width:297mm; min-height:210mm; padding:10mm; box-sizing:border-box; }
+          table{ width:100%; border-collapse:collapse; }
+          th,td{ border:1px solid #111; padding:6px; font-size:12px; }
+          th{ background:#f3f4f6; }
+          .row{display:flex; gap:10px;}
+          .col{flex:1;}
+          .right{text-align:right;}
+          .center{text-align:center;}
+          .muted{color:#444;}
+          .no-border, .no-border td, .no-border th { border:0 !important; }
+          .head{display:flex; align-items:center; justify-content:space-between; gap:10px;}
+          .sealbox{height:90px; width:130px; border:2px solid #111; display:flex; align-items:center; justify-content:center;}
+          .signbox{height:70px; border-top:1px solid #111; padding-top:8px;}
+        </style>
+      </head>
+      <body>
+        ${html}
+        <script>
+          window.onload = () => { window.print(); };
+        </script>
+      </body>
+    </html>
+  `);
+  w.document.close();
+}
+
+/* =========================
+   TRUCK MEMO PRINT (A4)
+   Requirements:
+   - Client left, Miller right
+   - Products table shows commodity + bags + mts (no rate/amount)
+   - Seal at bottom
+========================= */
+async function printTruckMemoOnly(memoId) {
+  const m = DB.truckMemos.find((x) => x.id === memoId);
+  if (!m) return;
+
+  const miller = DB.millers.find((x) => x.id === m.miller_id);
+  const client = DB.clients.find((x) => x.id === m.client_id);
+
+  const items = (m.items || []).map((it, i) => {
+    const prod = DB.products.find((p) => p.id === it.productId);
+    return `
+      <tr>
+        <td class="center">${i + 1}</td>
+        <td>${escapeHtml(prod?.name || "")}</td>
+        <td class="center">${(it.bags || 0).toFixed(0)}</td>
+        <td class="center">${(it.netMts || 0).toFixed(3)}</td>
+      </tr>
+    `;
+  }).join("");
+
+  const totalBags = (m.items || []).reduce((s, x) => s + (x.bags || 0), 0);
+  const totalMts  = (m.items || []).reduce((s, x) => s + (x.netMts || 0), 0);
+
+  // Logo & seal (optional - if later you save paths)
+  // For now keep empty placeholders; Part 4 will add Storage signed urls.
+  const logoImg = "";
+  const sealImg = "";
+
+  const html = `
+    <div class="a4">
+      <div class="head">
+        <div>
+          <div style="font-size:18px; font-weight:800;">${escapeHtml(miller?.name || "MILLER")}</div>
+          <div class="muted" style="font-size:12px;">${escapeHtml(miller?.address || "")}</div>
+        </div>
+        <div>${logoImg}</div>
+      </div>
+
+      <div style="margin-top:10px; text-align:center; font-size:16px; font-weight:800; letter-spacing:.6px;">
+        TRUCK MEMO
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <div class="col">
+          <div style="font-weight:700;">Client</div>
+          <div>${escapeHtml(client?.name || "")}</div>
+          <div class="muted">${escapeHtml(client?.address || "")}</div>
+        </div>
+        <div class="col right">
+          <div><b>Date:</b> ${escapeHtml(m.memo_date || "")}</div>
+          <div><b>Memo No:</b> ${escapeHtml(m.memo_no || "")}</div>
+          <div><b>Vehicle:</b> ${escapeHtml(m.vehicle_no || "")}</div>
+          <div><b>Driver:</b> ${escapeHtml(m.driver_name || "")}</div>
+          <div><b>Mobile:</b> ${escapeHtml(m.mobile || "")}</div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:45px;" class="center">S.No</th>
+              <th class="center">Commodity</th>
+              <th style="width:90px;" class="center">Bags</th>
+              <th style="width:110px;" class="center">Net MTS</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${items}
+            <tr>
+              <th colspan="2" class="right">Total</th>
+              <th class="center">${totalBags.toFixed(0)}</th>
+              <th class="center">${totalMts.toFixed(3)}</th>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div style="margin-top:18px; display:flex; justify-content:space-between; align-items:flex-end;">
+        <div style="width:55%;">
+          <div class="signbox"><b>Driver Signature</b></div>
+        </div>
+        <div style="width:40%; text-align:right;">
+          <div class="sealbox">${sealImg || "SEAL"}</div>
+          <div style="margin-top:6px; font-weight:700;">Authorized Signatory</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  openPrintWindow(html, "Truck Memo");
+}
+
+/* =========================
+   GATE PASS PRINT (LANDSCAPE)
+   45 format: fixed landscape style
+========================= */
+function printGatePassOnly(memoId) {
+  const m = DB.truckMemos.find((x) => x.id === memoId);
+  if (!m) return;
+
+  const miller = DB.millers.find((x) => x.id === m.miller_id);
+  const client = DB.clients.find((x) => x.id === m.client_id);
+
+  const totalBags = (m.items || []).reduce((s, x) => s + (x.bags || 0), 0);
+  const totalMts  = (m.items || []).reduce((s, x) => s + (x.netMts || 0), 0);
+
+  const html = `
+    <div class="land45">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+        <div>
+          <div style="font-size:18px; font-weight:900;">${escapeHtml(miller?.name || "MILLER")}</div>
+          <div class="muted" style="font-size:12px;">${escapeHtml(miller?.address || "")}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:16px; font-weight:900;">GATE PASS</div>
+          <div><b>Date:</b> ${escapeHtml(m.memo_date || "")}</div>
+          <div><b>Memo No:</b> ${escapeHtml(m.memo_no || "")}</div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <div class="col">
+          <div style="font-weight:700;">To (Client)</div>
+          <div>${escapeHtml(client?.name || "")}</div>
+          <div class="muted">${escapeHtml(client?.address || "")}</div>
+        </div>
+        <div class="col">
+          <div><b>Vehicle:</b> ${escapeHtml(m.vehicle_no || "")}</div>
+          <div><b>Driver:</b> ${escapeHtml(m.driver_name || "")}</div>
+          <div><b>Mobile:</b> ${escapeHtml(m.mobile || "")}</div>
+        </div>
+        <div class="col right">
+          <div><b>Total Bags:</b> ${totalBags.toFixed(0)}</div>
+          <div><b>Total Net MTS:</b> ${totalMts.toFixed(3)}</div>
+        </div>
+      </div>
+
+      <div style="margin-top:14px; display:flex; justify-content:space-between; gap:12px;">
+        <div style="flex:1;">
+          <div class="signbox"><b>Driver Signature</b></div>
+        </div>
+        <div style="flex:1; text-align:right;">
+          <div class="signbox"><b>Authorized Signatory</b></div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  openPrintWindow(html, "Gate Pass");
+}
+
+/* =========================
+   EXTEND startApp AGAIN
+========================= */
+const _startAppOld2 = startApp;
+startApp = function () {
+  _startAppOld2();
+
+  bindTruckMemoEvents();
+  renderTruckMemos();
+
+  // initialize items table with one row if empty
+  const table = $("tmItemsTable");
+  if (table) {
+    const tbody = table.querySelector("tbody") || table;
+    if (tbody.querySelectorAll("tr").length === 0) addItemRow();
+  }
+  recalcTotals();
+};
+
