@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Miller Management System (Offline)</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar noPrint">
+      <div class="brand">
+        <div class="brandLogo">MM</div>
+        <div>
+          <div class="brandTitle">Miller Management</div>
+          <div class="brandSub">Offline • localStorage</div>
+        </div>
+      </div>
+
+      <div class="sideSection">
+        <div class="sideLabel">Theme</div>
+        <div class="row gap8">
+          <button class="btn" id="btnTheme">Toggle Light/Dark</button>
+          <button class="btn" id="btnAccent">Accent</button>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <button class="navBtn active" data-route="dashboard">Dashboard</button>
+        <button class="navBtn" data-route="millers">Master • Millers</button>
+        <button class="navBtn" data-route="clients">Master • Clients</button>
+        <button class="navBtn" data-route="products">Master • Products</button>
+        <button class="navBtn" data-route="truckmemo">Truck Memo</button>
+        <button class="navBtn" data-route="reports">Reports</button>
+      </nav>
+
+      <div class="sideFooter">
+        <button class="btn danger" id="btnReset">Reset All Data</button>
+        <div class="hint">Tip: Export CSV opens in Excel. Backup JSON restores everything.</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar noPrint">
+        <div>
+          <h1 id="pageTitle">Dashboard</h1>
+          <div class="muted" id="pageSub">Quick totals & recent documents</div>
+        </div>
+        <div class="topActions">
+          <div class="pill">Storage: local</div>
+        </div>
+      </header>
+
+      <!-- DASHBOARD -->
+      <section class="page" id="page-dashboard">
+        <div class="grid3">
+          <div class="card">
+            <div class="cardTitle">Truck Memos</div>
+            <div class="big" id="dashTruckCount">0</div>
+            <div class="muted">Total created</div>
+          </div>
+          <div class="card">
+            <div class="cardTitle">Gate Passes</div>
+            <div class="big" id="dashGateCount">0</div>
+            <div class="muted">Auto from Truck Memos</div>
+          </div>
+          <div class="card">
+            <div class="cardTitle">Net MTS</div>
+            <div class="big" id="dashNetMts">0.000</div>
+            <div class="muted">Sum of all items</div>
+          </div>
+        </div>
+
+        <div class="card mt16">
+          <div class="cardTitle">Recent Truck Memos</div>
+          <div class="tableWrap mt12">
+            <table class="table" id="dashRecentTable">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Memo No</th>
+                  <th>Date</th>
+                  <th>Miller</th>
+                  <th>Client</th>
+                  <th>Vehicle</th>
+                  <th>Total Bags</th>
+                  <th>Total Net MTS</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- MILLERS -->
+      <section class="page hidden" id="page-millers">
+        <div class="card">
+          <div class="row between">
+            <div>
+              <div class="cardTitle">Miller Master</div>
+              <div class="muted">Add/Edit/Delete millers + logo + seal</div>
+            </div>
+            <button class="btn primary" id="btnAddMiller">+ Add Miller</button>
+          </div>
+
+          <div class="tableWrap mt12">
+            <table class="table" id="tblMillers">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Mobile</th>
+                  <th>Address</th>
+                  <th>Logo</th>
+                  <th>Seal</th>
+                  <th class="w160">Actions</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- CLIENTS -->
+      <section class="page hidden" id="page-clients">
+        <div class="card">
+          <div class="row between">
+            <div>
+              <div class="cardTitle">Client Master</div>
+              <div class="muted">Add/Edit/Delete clients with address</div>
+            </div>
+            <button class="btn primary" id="btnAddClient">+ Add Client</button>
+          </div>
+
+          <div class="tableWrap mt12">
+            <table class="table" id="tblClients">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Mobile</th>
+                  <th>Address</th>
+                  <th class="w160">Actions</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- PRODUCTS -->
+      <section class="page hidden" id="page-products">
+        <div class="card">
+          <div class="row between">
+            <div>
+              <div class="cardTitle">Product Master</div>
+              <div class="muted">Commodity / product list</div>
+            </div>
+            <button class="btn primary" id="btnAddProduct">+ Add Product</button>
+          </div>
+
+          <div class="tableWrap mt12">
+            <table class="table" id="tblProducts">
+              <thead>
+                <tr>
+                  <th>Commodity</th>
+                  <th>HSN (optional)</th>
+                  <th class="w160">Actions</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TRUCK MEMO -->
+      <section class="page hidden" id="page-truckmemo">
+        <div class="grid2">
+          <div class="card">
+            <div class="cardTitle">Create / Edit Truck Memo</div>
+            <div class="muted">Add multiple products. Rate/Amount stored. Print memo hides rate/amount.</div>
+
+            <form id="frmTruck" class="form mt12">
+              <div class="grid2">
+                <label class="field">
+                  <span>Date</span>
+                  <input type="date" id="tmDate" required />
+                </label>
+
+                <label class="field">
+                  <span>Client</span>
+                  <select id="tmClient" required></select>
+                </label>
+
+                <label class="field">
+                  <span>Miller</span>
+                  <select id="tmMiller" required></select>
+                </label>
+
+                <label class="field">
+                  <span>Vehicle Number</span>
+                  <input id="tmVehicle" required />
+                </label>
+
+                <label class="field">
+                  <span>Driver Name</span>
+                  <input id="tmDriver" required />
+                </label>
+
+                <label class="field">
+                  <span>Mobile Number</span>
+                  <input id="tmMobile" inputmode="numeric" required />
+                </label>
+              </div>
+
+              <div class="mt12">
+                <div class="row between">
+                  <div>
+                    <div class="cardTitle" style="font-size:14px">Commodity Items</div>
+                    <div class="muted">Each row: Product, Bags, Net MTS, Rate Mode, Rate, Amount</div>
+                  </div>
+                  <button type="button" class="btn" id="btnAddItemRow">+ Add Row</button>
+                </div>
+
+                <div class="tableWrap mt12">
+                  <table class="table" id="tmItemsTable" style="min-width:1100px">
+                    <thead>
+                      <tr>
+                        <th style="width:40px">#</th>
+                        <th>Commodity</th>
+                        <th style="width:120px">Bags</th>
+                        <th style="width:140px">Net MTS</th>
+                        <th style="width:150px">Rate Mode</th>
+                        <th style="width:140px">Rate</th>
+                        <th style="width:160px">Amount (Auto)</th>
+                        <th style="width:90px">Remove</th>
+                      </tr>
+                    </thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+
+                <div class="row between mt12">
+                  <div class="muted" id="tmEditHint">Creating new memo.</div>
+                  <div style="font-weight:900;font-size:16px">
+                    Grand Total: ₹ <span id="tmGrandTotal">0.00</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="row gap8 mt12">
+                <button type="submit" class="btn primary" id="btnSaveMemo">Save Truck Memo</button>
+                <button type="button" class="btn" id="btnClearTruck">Clear</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">Preview / Print</div>
+            <div class="muted">Truck Memo A4 • Gate Pass A5 Landscape</div>
+
+            <div class="row gap8 mt12">
+              <button class="btn" id="btnPreviewTruck" type="button">Preview Truck Memo</button>
+              <button class="btn" id="btnPreviewGate" type="button">Preview Gate Pass</button>
+            </div>
+
+            <div class="preview mt12" id="previewArea">
+              <div class="muted">Create or select a memo from Reports, then preview here.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- REPORTS -->
+      <section class="page hidden" id="page-reports">
+        <div class="card">
+          <div class="row between">
+            <div>
+              <div class="cardTitle">Reports</div>
+              <div class="muted">Filter • Edit/Delete • Export • Backup • Report PDF</div>
+            </div>
+
+            <div class="row gap8">
+              <button class="btn" id="btnExportBackup">Export Backup</button>
+              <input type="file" id="inpImportBackup" accept="application/json" style="display:none" />
+              <button class="btn" id="btnImportBackup">Import Backup</button>
+              <button class="btn" id="btnExportCSV">Export CSV</button>
+            </div>
+          </div>
+
+          <div class="grid6 mt12">
+            <label class="field">
+              <span>From</span>
+              <input type="date" id="rFrom" />
+            </label>
+            <label class="field">
+              <span>To</span>
+              <input type="date" id="rTo" />
+            </label>
+            <label class="field">
+              <span>Miller</span>
+              <select id="rMiller"></select>
+            </label>
+            <label class="field">
+              <span>Client</span>
+              <select id="rClient"></select>
+            </label>
+            <label class="field">
+              <span>Product</span>
+              <select id="rProduct"></select>
+            </label>
+            <label class="field">
+              <span>Rate Mode</span>
+              <select id="rRateMode">
+                <option value="">All</option>
+                <option value="BAG">Bag</option>
+                <option value="MTS">MTS</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="grid4 mt12">
+            <label class="field">
+              <span>Amount Min</span>
+              <input type="number" id="rAmtMin" min="0" step="0.01" placeholder="0" />
+            </label>
+            <label class="field">
+              <span>Amount Max</span>
+              <input type="number" id="rAmtMax" min="0" step="0.01" placeholder="999999" />
+            </label>
+            <div></div><div></div>
+          </div>
+
+          <div class="row gap8 mt12">
+            <button class="btn primary" id="btnApplyFilter">Apply Filter</button>
+            <button class="btn" id="btnClearFilter">Clear</button>
+          </div>
+
+          <div class="card mt16">
+            <div class="row between">
+              <div>
+                <div class="cardTitle" style="font-size:14px">Report PDF (Bank Statement Style)</div>
+                <div class="muted">Generates printable PDF using Print → Save as PDF</div>
+              </div>
+              <div class="row gap8">
+                <label class="chip">
+                  <input type="checkbox" id="rIncludeRateAmt" checked />
+                  <span>Include Rate & Amount</span>
+                </label>
+                <button class="btn primary" id="btnReportPDF">Generate Report PDF</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="tableWrap mt12">
+            <table class="table" id="tblReports">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Memo No</th>
+                  <th>Date</th>
+                  <th>Miller</th>
+                  <th>Client</th>
+                  <th>Vehicle</th>
+                  <th>Total Bags</th>
+                  <th>Total Net MTS</th>
+                  <th>Total Amount</th>
+                  <th class="w220">Actions</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- MODAL -->
+  <div class="modal hidden" id="modal">
+    <div class="modalCard">
+      <div class="row between">
+        <div class="cardTitle" id="modalTitle">Modal</div>
+        <button class="iconBtn" id="modalClose">✕</button>
+      </div>
+      <div id="modalBody" class="mt12"></div>
+    </div>
+  </div>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>
