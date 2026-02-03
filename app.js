@@ -1816,5 +1816,10 @@ startApp = function () {
   bindBackupEvents();
   refreshReportDropdowns();
 };
+// ===== BOOT APP =====
+window.addEventListener("DOMContentLoaded", () => {
+  waitForLogin();
+});
+
 
 
