@@ -1110,4 +1110,711 @@ startApp = function () {
   }
   recalcTotals();
 };
+/* =========================================================
+   PART 4/4 – Storage (Logo/Seal) + Reports + Export + Backup
+   ========================================================= */
+
+/* =========================
+   STORAGE: Upload + Signed URL
+   Bucket: assets (private)
+========================= */
+const _signedCache = new Map(); // path -> {url, exp}
+
+async function signedUrl(path) {
+  if (!path) return "";
+  const hit = _signedCache.get(path);
+  if (hit && hit.exp > Date.now()) return hit.url;
+
+  const { data, error } = await supabase.storage
+    .from("assets")
+    .createSignedUrl(path, 60 * 60); // 1 hour
+
+  if (error) {
+    console.warn("Signed URL error:", error.message);
+    return "";
+  }
+
+  _signedCache.set(path, { url: data.signedUrl, exp: Date.now() + 55 * 60 * 1000 });
+  return data.signedUrl;
+}
+
+async function uploadToAssets(file, folder, millerId) {
+  const user = await currentUser();
+  if (!user) throw new Error("Login required");
+
+  const ext = (file.name.split(".").pop() || "png").toLowerCase();
+  const path = `${folder}/${user.id}/${millerId}.${ext}`;
+
+  const { error } = await supabase.storage
+    .from("assets")
+    .upload(path, file, { upsert: true });
+
+  if (error) throw error;
+
+  _signedCache.delete(path);
+  return path;
+}
+
+/* =========================
+   MILLER LOGO/SEAL UPLOAD
+   Expected HTML:
+   - file inputs: #millerLogoFile #millerSealFile
+   - buttons: #btnUploadMillerLogo #btnUploadMillerSeal
+   - optional preview imgs: #millerLogoPreview #millerSealPreview
+========================= */
+function bindMillerImageEvents() {
+  if ($("btnUploadMillerLogo")) $("btnUploadMillerLogo").onclick = uploadMillerLogo;
+  if ($("btnUploadMillerSeal")) $("btnUploadMillerSeal").onclick = uploadMillerSeal;
+}
+
+async function uploadMillerLogo() {
+  try {
+    if (!editMillerId) return toast("First select Miller (Edit) then upload Logo");
+    const file = $("millerLogoFile")?.files?.[0];
+    if (!file) return toast("Choose a logo file");
+
+    const path = await uploadToAssets(file, "logos", editMillerId);
+
+    // update DB row
+    const ix = DB.millers.findIndex((x) => x.id === editMillerId);
+    if (ix < 0) return toast("Miller not found");
+
+    DB.millers[ix].logo_path = path;
+    await upsertRow("millers", {
+      ...DB.millers[ix],
+      updated_at: new Date().toISOString()
+    });
+
+    // preview
+    const url = await signedUrl(path);
+    if ($("millerLogoPreview")) $("millerLogoPreview").src = url;
+
+    toast("Logo uploaded");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+async function uploadMillerSeal() {
+  try {
+    if (!editMillerId) return toast("First select Miller (Edit) then upload Seal");
+    const file = $("millerSealFile")?.files?.[0];
+    if (!file) return toast("Choose a seal file");
+
+    const path = await uploadToAssets(file, "seals", editMillerId);
+
+    const ix = DB.millers.findIndex((x) => x.id === editMillerId);
+    if (ix < 0) return toast("Miller not found");
+
+    DB.millers[ix].seal_path = path;
+    await upsertRow("millers", {
+      ...DB.millers[ix],
+      updated_at: new Date().toISOString()
+    });
+
+    const url = await signedUrl(path);
+    if ($("millerSealPreview")) $("millerSealPreview").src = url;
+
+    toast("Seal uploaded");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+/* =========================
+   PATCH: When opening a miller edit, show previews if present
+========================= */
+const _openMillerEditOld = openMillerEdit;
+openMillerEdit = async function (id) {
+  _openMillerEditOld(id);
+
+  const m = DB.millers.find((x) => x.id === id);
+  if (!m) return;
+
+  if ($("millerLogoPreview")) {
+    $("millerLogoPreview").src = m.logo_path ? await signedUrl(m.logo_path) : "";
+  }
+  if ($("millerSealPreview")) {
+    $("millerSealPreview").src = m.seal_path ? await signedUrl(m.seal_path) : "";
+  }
+};
+
+/* =========================
+   PRINT TRUCK MEMO WITH LOGO + SEAL
+   (Override the previous version to inject signed URLs)
+========================= */
+const _printTruckMemoOnlyOld = printTruckMemoOnly;
+printTruckMemoOnly = async function (memoId) {
+  const m = DB.truckMemos.find((x) => x.id === memoId);
+  if (!m) return;
+
+  const miller = DB.millers.find((x) => x.id === m.miller_id);
+  const client = DB.clients.find((x) => x.id === m.client_id);
+
+  const items = (m.items || [])
+    .map((it, i) => {
+      const prod = DB.products.find((p) => p.id === it.productId);
+      return `
+        <tr>
+          <td class="center">${i + 1}</td>
+          <td>${escapeHtml(prod?.name || "")}</td>
+          <td class="center">${(it.bags || 0).toFixed(0)}</td>
+          <td class="center">${(it.netMts || 0).toFixed(3)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  const totalBags = (m.items || []).reduce((s, x) => s + (x.bags || 0), 0);
+  const totalMts = (m.items || []).reduce((s, x) => s + (x.netMts || 0), 0);
+
+  const logoUrl = miller?.logo_path ? await signedUrl(miller.logo_path) : "";
+  const sealUrl = miller?.seal_path ? await signedUrl(miller.seal_path) : "";
+
+  const logoImg = logoUrl
+    ? `<img src="${logoUrl}" style="height:70px; object-fit:contain;">`
+    : "";
+
+  const sealImg = sealUrl
+    ? `<img src="${sealUrl}" style="max-height:84px; max-width:120px; object-fit:contain;">`
+    : "SEAL";
+
+  const html = `
+    <div class="a4">
+      <div class="head">
+        <div>
+          <div style="font-size:20px; font-weight:900;">${escapeHtml(miller?.name || "MILLER")}</div>
+          <div class="muted" style="font-size:12px;">${escapeHtml(miller?.address || "")}</div>
+        </div>
+        <div>${logoImg}</div>
+      </div>
+
+      <div style="margin-top:10px; text-align:center; font-size:16px; font-weight:900; letter-spacing:.6px;">
+        TRUCK MEMO
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <div class="col">
+          <div style="font-weight:800;">Client</div>
+          <div>${escapeHtml(client?.name || "")}</div>
+          <div class="muted">${escapeHtml(client?.address || "")}</div>
+        </div>
+        <div class="col right">
+          <div><b>Date:</b> ${escapeHtml(m.memo_date || "")}</div>
+          <div><b>Memo No:</b> ${escapeHtml(m.memo_no || "")}</div>
+          <div><b>Vehicle:</b> ${escapeHtml(m.vehicle_no || "")}</div>
+          <div><b>Driver:</b> ${escapeHtml(m.driver_name || "")}</div>
+          <div><b>Mobile:</b> ${escapeHtml(m.mobile || "")}</div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:45px;" class="center">S.No</th>
+              <th class="center">Commodity</th>
+              <th style="width:90px;" class="center">Bags</th>
+              <th style="width:110px;" class="center">Net MTS</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${items}
+            <tr>
+              <th colspan="2" class="right">Total</th>
+              <th class="center">${totalBags.toFixed(0)}</th>
+              <th class="center">${totalMts.toFixed(3)}</th>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div style="margin-top:18px; display:flex; justify-content:space-between; align-items:flex-end;">
+        <div style="width:55%;">
+          <div class="signbox"><b>Driver Signature</b></div>
+        </div>
+        <div style="width:40%; text-align:right;">
+          <div class="sealbox">${sealImg}</div>
+          <div style="margin-top:6px; font-weight:800;">Authorized Signatory</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  openPrintWindow(html, "Truck Memo");
+};
+
+/* =========================
+   REPORTS (FILTERS + PDF + EXPORT)
+   Expected HTML input IDs (if missing, features will just not run):
+   Filters:
+   #rptFrom #rptTo #rptMiller #rptClient #rptProduct #rptMode
+   #rptAmtMin #rptAmtMax
+   options:
+   #rptShowRate (checkbox) -> include rate & amount columns
+   buttons:
+   #btnRunReport #btnReportPDF #btnExportCSV #btnExportExcel
+   table:
+   #tblReport (tbody)
+========================= */
+function bindReportEvents() {
+  if ($("btnRunReport")) $("btnRunReport").onclick = runReport;
+  if ($("btnReportPDF")) $("btnReportPDF").onclick = reportPDF;
+  if ($("btnExportCSV")) $("btnExportCSV").onclick = exportReportCSV;
+  if ($("btnExportExcel")) $("btnExportExcel").onclick = exportReportExcel;
+
+  // Fill report dropdowns if exist
+  refreshReportDropdowns();
+}
+
+function refreshReportDropdowns() {
+  // miller
+  if ($("rptMiller")) {
+    $("rptMiller").innerHTML = `<option value="">All Millers</option>` +
+      DB.millers
+        .slice()
+        .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+        .map((m) => `<option value="${m.id}">${escapeHtml(m.name)}</option>`)
+        .join("");
+  }
+  // client
+  if ($("rptClient")) {
+    $("rptClient").innerHTML = `<option value="">All Clients</option>` +
+      DB.clients
+        .slice()
+        .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+        .map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`)
+        .join("");
+  }
+  // product
+  if ($("rptProduct")) {
+    $("rptProduct").innerHTML = `<option value="">All Products</option>` +
+      DB.products
+        .slice()
+        .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+        .map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`)
+        .join("");
+  }
+  // mode
+  if ($("rptMode")) {
+    $("rptMode").innerHTML = `
+      <option value="">All Modes</option>
+      <option value="BAG">Per Bag</option>
+      <option value="MTS">Per MTS</option>
+    `;
+  }
+}
+
+function parseDateISO(s) {
+  // expects YYYY-MM-DD
+  if (!s) return null;
+  const t = Date.parse(s + "T00:00:00");
+  return isNaN(t) ? null : t;
+}
+
+function memoTotalAmount(m) {
+  return (m.items || []).reduce((s, it) => s + (it.amount || 0), 0);
+}
+
+function memoHasProduct(m, productId) {
+  return (m.items || []).some((it) => it.productId === productId);
+}
+
+function memoHasMode(m, mode) {
+  return (m.items || []).some((it) => it.rateMode === mode);
+}
+
+function getFilteredMemos() {
+  const from = parseDateISO($("rptFrom")?.value || "");
+  const to = parseDateISO($("rptTo")?.value || "");
+  const millerId = $("rptMiller")?.value || "";
+  const clientId = $("rptClient")?.value || "";
+  const productId = $("rptProduct")?.value || "";
+  const mode = $("rptMode")?.value || "";
+
+  const amtMin = parseFloat($("rptAmtMin")?.value || "") || null;
+  const amtMax = parseFloat($("rptAmtMax")?.value || "") || null;
+
+  return DB.truckMemos.filter((m) => {
+    const d = parseDateISO(m.memo_date);
+    if (from && d && d < from) return false;
+    if (to && d && d > to) return false;
+    if (millerId && m.miller_id !== millerId) return false;
+    if (clientId && m.client_id !== clientId) return false;
+    if (productId && !memoHasProduct(m, productId)) return false;
+    if (mode && !memoHasMode(m, mode)) return false;
+
+    const tot = memoTotalAmount(m);
+    if (amtMin !== null && tot < amtMin) return false;
+    if (amtMax !== null && tot > amtMax) return false;
+
+    return true;
+  });
+}
+
+function runReport() {
+  const list = getFilteredMemos();
+  renderReport(list);
+  toast(`Report: ${list.length} memo(s)`);
+}
+
+function renderReport(list) {
+  const tbl = $("tblReport");
+  if (!tbl) return;
+  const tbody = tbl.querySelector("tbody") || tbl;
+  tbody.innerHTML = "";
+
+  const showRate = !!$("rptShowRate")?.checked;
+
+  list.forEach((m) => {
+    const miller = DB.millers.find((x) => x.id === m.miller_id);
+    const client = DB.clients.find((x) => x.id === m.client_id);
+
+    // Each memo expands to multiple rows (items) like bank statement
+    (m.items || []).forEach((it, idx) => {
+      const prod = DB.products.find((p) => p.id === it.productId);
+
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${escapeHtml(m.memo_date || "")}</td>
+        <td>${escapeHtml(m.memo_no || "")}</td>
+        <td>${escapeHtml(miller?.name || "")}</td>
+        <td>${escapeHtml(client?.name || "")}</td>
+        <td>${escapeHtml(prod?.name || "")}</td>
+        <td style="text-align:right">${(it.bags || 0).toFixed(0)}</td>
+        <td style="text-align:right">${(it.netMts || 0).toFixed(3)}</td>
+        ${showRate ? `<td class="center">${it.rateMode === "BAG" ? "Per Bag" : "Per MTS"}</td>` : ""}
+        ${showRate ? `<td style="text-align:right">${(it.rate || 0).toFixed(2)}</td>` : ""}
+        ${showRate ? `<td style="text-align:right">${(it.amount || 0).toFixed(2)}</td>` : ""}
+      `;
+      tbody.appendChild(tr);
+    });
+  });
+}
+
+/* =========================
+   REPORT PDF (BANK STATEMENT STYLE)
+========================= */
+function reportPDF() {
+  const list = getFilteredMemos();
+  const showRate = !!$("rptShowRate")?.checked;
+
+  const rows = [];
+  list.forEach((m) => {
+    const miller = DB.millers.find((x) => x.id === m.miller_id);
+    const client = DB.clients.find((x) => x.id === m.client_id);
+
+    (m.items || []).forEach((it) => {
+      const prod = DB.products.find((p) => p.id === it.productId);
+      rows.push({
+        date: m.memo_date || "",
+        memo: m.memo_no || "",
+        miller: miller?.name || "",
+        client: client?.name || "",
+        product: prod?.name || "",
+        bags: (it.bags || 0).toFixed(0),
+        mts: (it.netMts || 0).toFixed(3),
+        mode: it.rateMode === "BAG" ? "Per Bag" : "Per MTS",
+        rate: (it.rate || 0).toFixed(2),
+        amt: (it.amount || 0).toFixed(2)
+      });
+    });
+  });
+
+  const headCols = showRate
+    ? `<th>Date</th><th>Memo No</th><th>Miller</th><th>Client</th><th>Product</th><th class="right">Bags</th><th class="right">Net MTS</th><th class="center">Mode</th><th class="right">Rate</th><th class="right">Amount</th>`
+    : `<th>Date</th><th>Memo No</th><th>Miller</th><th>Client</th><th>Product</th><th class="right">Bags</th><th class="right">Net MTS</th>`;
+
+  const body = rows
+    .map((r) => {
+      return showRate
+        ? `<tr>
+            <td>${escapeHtml(r.date)}</td>
+            <td>${escapeHtml(r.memo)}</td>
+            <td>${escapeHtml(r.miller)}</td>
+            <td>${escapeHtml(r.client)}</td>
+            <td>${escapeHtml(r.product)}</td>
+            <td class="right">${r.bags}</td>
+            <td class="right">${r.mts}</td>
+            <td class="center">${escapeHtml(r.mode)}</td>
+            <td class="right">${r.rate}</td>
+            <td class="right">${r.amt}</td>
+          </tr>`
+        : `<tr>
+            <td>${escapeHtml(r.date)}</td>
+            <td>${escapeHtml(r.memo)}</td>
+            <td>${escapeHtml(r.miller)}</td>
+            <td>${escapeHtml(r.client)}</td>
+            <td>${escapeHtml(r.product)}</td>
+            <td class="right">${r.bags}</td>
+            <td class="right">${r.mts}</td>
+          </tr>`;
+    })
+    .join("");
+
+  const html = `
+    <div class="a4">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end;">
+        <div>
+          <div style="font-size:18px; font-weight:900;">REPORT</div>
+          <div class="muted" style="font-size:12px;">Bank Statement Style</div>
+        </div>
+        <div class="muted" style="font-size:12px;">Generated: ${new Date().toLocaleString()}</div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <table>
+          <thead>
+            <tr>${headCols}</tr>
+          </thead>
+          <tbody>
+            ${body || `<tr><td colspan="${showRate ? 10 : 7}" class="center">No records</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  openPrintWindow(html, "Report PDF");
+}
+
+/* =========================
+   EXPORT CSV (Report rows)
+========================= */
+function exportReportCSV() {
+  const list = getFilteredMemos();
+  const showRate = !!$("rptShowRate")?.checked;
+
+  const lines = [];
+  const header = showRate
+    ? ["Date", "MemoNo", "Miller", "Client", "Product", "Bags", "NetMTS", "Mode", "Rate", "Amount"]
+    : ["Date", "MemoNo", "Miller", "Client", "Product", "Bags", "NetMTS"];
+  lines.push(header.join(","));
+
+  list.forEach((m) => {
+    const miller = DB.millers.find((x) => x.id === m.miller_id);
+    const client = DB.clients.find((x) => x.id === m.client_id);
+
+    (m.items || []).forEach((it) => {
+      const prod = DB.products.find((p) => p.id === it.productId);
+      const row = showRate
+        ? [
+            m.memo_date || "",
+            m.memo_no || "",
+            (miller?.name || ""),
+            (client?.name || ""),
+            (prod?.name || ""),
+            (it.bags || 0),
+            (it.netMts || 0),
+            (it.rateMode === "BAG" ? "Per Bag" : "Per MTS"),
+            (it.rate || 0),
+            (it.amount || 0)
+          ]
+        : [
+            m.memo_date || "",
+            m.memo_no || "",
+            (miller?.name || ""),
+            (client?.name || ""),
+            (prod?.name || ""),
+            (it.bags || 0),
+            (it.netMts || 0)
+          ];
+      lines.push(row.map(csvCell).join(","));
+    });
+  });
+
+  downloadTextFile(lines.join("\n"), "report.csv", "text/csv");
+}
+
+function csvCell(v) {
+  const s = String(v ?? "");
+  if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+    return `"${s.replaceAll('"', '""')}"`;
+  }
+  return s;
+}
+
+/* =========================
+   EXPORT EXCEL (HTML Excel)
+   Works without external libs
+========================= */
+function exportReportExcel() {
+  const list = getFilteredMemos();
+  const showRate = !!$("rptShowRate")?.checked;
+
+  const head = showRate
+    ? `<tr><th>Date</th><th>Memo No</th><th>Miller</th><th>Client</th><th>Product</th><th>Bags</th><th>Net MTS</th><th>Mode</th><th>Rate</th><th>Amount</th></tr>`
+    : `<tr><th>Date</th><th>Memo No</th><th>Miller</th><th>Client</th><th>Product</th><th>Bags</th><th>Net MTS</th></tr>`;
+
+  let body = "";
+  list.forEach((m) => {
+    const miller = DB.millers.find((x) => x.id === m.miller_id);
+    const client = DB.clients.find((x) => x.id === m.client_id);
+    (m.items || []).forEach((it) => {
+      const prod = DB.products.find((p) => p.id === it.productId);
+      body += showRate
+        ? `<tr>
+            <td>${escapeHtml(m.memo_date || "")}</td>
+            <td>${escapeHtml(m.memo_no || "")}</td>
+            <td>${escapeHtml(miller?.name || "")}</td>
+            <td>${escapeHtml(client?.name || "")}</td>
+            <td>${escapeHtml(prod?.name || "")}</td>
+            <td style="text-align:right">${(it.bags || 0).toFixed(0)}</td>
+            <td style="text-align:right">${(it.netMts || 0).toFixed(3)}</td>
+            <td>${escapeHtml(it.rateMode === "BAG" ? "Per Bag" : "Per MTS")}</td>
+            <td style="text-align:right">${(it.rate || 0).toFixed(2)}</td>
+            <td style="text-align:right">${(it.amount || 0).toFixed(2)}</td>
+          </tr>`
+        : `<tr>
+            <td>${escapeHtml(m.memo_date || "")}</td>
+            <td>${escapeHtml(m.memo_no || "")}</td>
+            <td>${escapeHtml(miller?.name || "")}</td>
+            <td>${escapeHtml(client?.name || "")}</td>
+            <td>${escapeHtml(prod?.name || "")}</td>
+            <td style="text-align:right">${(it.bags || 0).toFixed(0)}</td>
+            <td style="text-align:right">${(it.netMts || 0).toFixed(3)}</td>
+          </tr>`;
+    });
+  });
+
+  const html = `
+    <html><head><meta charset="utf-8"></head>
+    <body>
+      <table border="1">
+        ${head}
+        ${body || `<tr><td colspan="${showRate ? 10 : 7}">No records</td></tr>`}
+      </table>
+    </body></html>
+  `;
+
+  const blob = new Blob([html], { type: "application/vnd.ms-excel" });
+  const url = URL.createObjectURL(blob);
+  triggerDownload(url, "report.xls");
+}
+
+/* =========================
+   BACKUP EXPORT / IMPORT (JSON)
+   Expected HTML:
+   - button #btnBackupExport
+   - file input #backupFile
+   - button #btnBackupImport
+========================= */
+function bindBackupEvents() {
+  if ($("btnBackupExport")) $("btnBackupExport").onclick = backupExport;
+  if ($("btnBackupImport")) $("btnBackupImport").onclick = backupImport;
+}
+
+function backupExport() {
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    db: DB
+  };
+  downloadTextFile(JSON.stringify(payload, null, 2), "miller_backup.json", "application/json");
+}
+
+async function backupImport() {
+  try {
+    const file = $("backupFile")?.files?.[0];
+    if (!file) return toast("Choose backup JSON file");
+
+    const text = await file.text();
+    const payload = JSON.parse(text);
+    const db = payload?.db;
+
+    if (!db || !db.millers || !db.clients || !db.products || !db.truckMemos) {
+      return toast("Invalid backup format");
+    }
+
+    if (!confirm("Import will overwrite ONLINE database for this account. Continue?")) return;
+
+    // Overwrite: delete existing then insert all.
+    // We do it table-by-table.
+    await overwriteTable("truck_memos", db.truckMemos);
+    await overwriteTable("millers", db.millers);
+    await overwriteTable("clients", db.clients);
+    await overwriteTable("products", db.products);
+
+    // reload from supabase (source of truth)
+    await loadAllFromSupabase();
+
+    // refresh UI
+    renderMillers();
+    renderClients();
+    renderProducts();
+    refreshDropdowns();
+    refreshReportDropdowns();
+    renderTruckMemos();
+    toast("Backup imported successfully");
+  } catch (e) {
+    toast(e.message || String(e));
+  }
+}
+
+async function overwriteTable(table, rows) {
+  // Delete all rows for this user
+  const user = await currentUser();
+  if (!user) throw new Error("Login required");
+
+  // Fetch ids (safe approach)
+  const existing = await loadTable(table);
+  for (const r of existing) {
+    await deleteRow(table, r.id);
+  }
+
+  // Insert all (ensure user_id exists)
+  for (const r of rows) {
+    const row = { ...r };
+    row.user_id = user.id;
+    if (!row.id) row.id = uid("IMP");
+
+    // Truck memo fields naming check
+    if (table === "truck_memos") {
+      // normalize if backup uses different keys (defensive)
+      row.memo_no = row.memo_no ?? row.memoNo ?? row.memo_no ?? "";
+      row.memo_date = row.memo_date ?? row.date ?? row.memo_date ?? todayISO();
+      row.miller_id = row.miller_id ?? row.millerId ?? "";
+      row.client_id = row.client_id ?? row.clientId ?? "";
+      row.items = row.items ?? [];
+    }
+
+    row.updated_at = new Date().toISOString();
+    await upsertRow(table, row);
+  }
+}
+
+/* =========================
+   DOWNLOAD HELPERS
+========================= */
+function triggerDownload(url, filename) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function downloadTextFile(text, filename, mime) {
+  const blob = new Blob([text], { type: mime || "text/plain" });
+  const url = URL.createObjectURL(blob);
+  triggerDownload(url, filename);
+}
+
+/* =========================
+   EXTEND startApp FINAL
+========================= */
+const _startAppOld3 = startApp;
+startApp = function () {
+  _startAppOld3();
+
+  // images (logo/seal)
+  bindMillerImageEvents();
+
+  // reports/export/backup
+  bindReportEvents();
+  bindBackupEvents();
+  refreshReportDropdowns();
+};
+
 
